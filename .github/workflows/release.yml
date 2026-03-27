@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          # Extract version from ScribeCLI.swift
+          VERSION=$(sed -n 's/.*version: "\([^"]*\)".*/\1/p' Sources/scribe/ScribeCLI.swift)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Check if tag already exists
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Tag v$VERSION already exists, skipping release"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Will create release v$VERSION"
+          fi
+
+      - name: Build release binary
+        if: steps.version.outputs.skip == 'false'
+        run: |
+          swift build -c release --arch arm64
+          cp .build/release/scribe scribe-macos
+          file scribe-macos
+          ls -lh scribe-macos
+
+      - name: Create tarball
+        if: steps.version.outputs.skip == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          tar -czf "scribe-${VERSION}-macos-arm64.tar.gz" scribe-macos
+          shasum -a 256 "scribe-${VERSION}-macos-arm64.tar.gz" | tee sha256.txt
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "scribe v${VERSION}" \
+            --generate-notes \
+            "scribe-${VERSION}-macos-arm64.tar.gz" \
+            sha256.txt
+
+      - name: Update Homebrew tap
+        if: steps.version.outputs.skip == 'false' && secrets.TAP_TOKEN != ''
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA256=$(awk '{print $1}' sha256.txt)
+          URL="https://github.com/theam/scribe/releases/download/v${VERSION}/scribe-${VERSION}-macos-arm64.tar.gz"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/theam/homebrew-tap.git" tap-repo
+          cd tap-repo
+
+          cat > Formula/scribe.rb << EOF
+class Scribe < Formula
+  desc "State-of-the-art local audio transcription with speaker diarization for macOS"
+  homepage "https://github.com/theam/scribe"
+  url "${URL}"
+  sha256 "${SHA256}"
+  license "Apache-2.0"
+
+  def install
+    bin.install "scribe-macos" => "scribe"
+  end
+
+  test do
+    assert_match "scribe", shell_output("\#{bin}/scribe --version")
+  end
+end
+EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/scribe.rb
+          git commit -m "Update scribe to v${VERSION}" || echo "No changes"
+          git push
