@@ -15,7 +15,11 @@ State-of-the-art local audio transcription with speaker diarization for macOS.
 
 ## Install
 
-Build from source (Homebrew formula coming soon):
+```bash
+brew install theam/tap/scribe
+```
+
+Or build from source:
 
 ```bash
 git clone https://github.com/theam/scribe.git
