@@ -18,11 +18,9 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          # Extract version from ScribeCLI.swift
           VERSION=$(sed -n 's/.*version: "\([^"]*\)".*/\1/p' Sources/scribe/ScribeCLI.swift)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # Check if tag already exists
           if git rev-parse "v$VERSION" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Tag v$VERSION already exists, skipping release"
@@ -59,10 +57,15 @@ jobs:
             sha256.txt
 
       - name: Update Homebrew tap
-        if: steps.version.outputs.skip == 'false' && secrets.TAP_TOKEN != ''
+        if: steps.version.outputs.skip == 'false'
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "TAP_TOKEN not set, skipping Homebrew tap update"
+            exit 0
+          fi
+
           VERSION="${{ steps.version.outputs.version }}"
           SHA256=$(awk '{print $1}' sha256.txt)
           URL="https://github.com/theam/scribe/releases/download/v${VERSION}/scribe-${VERSION}-macos-arm64.tar.gz"
@@ -70,12 +73,12 @@ jobs:
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/theam/homebrew-tap.git" tap-repo
           cd tap-repo
 
-          cat > Formula/scribe.rb << EOF
+          cat > Formula/scribe.rb << 'ENDOFFORMULA'
 class Scribe < Formula
   desc "State-of-the-art local audio transcription with speaker diarization for macOS"
   homepage "https://github.com/theam/scribe"
-  url "${URL}"
-  sha256 "${SHA256}"
+  url "RELEASE_URL"
+  sha256 "RELEASE_SHA256"
   license "Apache-2.0"
 
   def install
@@ -83,10 +86,14 @@ class Scribe < Formula
   end
 
   test do
-    assert_match "scribe", shell_output("\#{bin}/scribe --version")
+    assert_match "scribe", shell_output("#{bin}/scribe --version")
   end
 end
-EOF
+ENDOFFORMULA
+
+          # Replace placeholders with actual values
+          sed -i '' "s|RELEASE_URL|${URL}|" Formula/scribe.rb
+          sed -i '' "s|RELEASE_SHA256|${SHA256}|" Formula/scribe.rb
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
