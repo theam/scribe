@@ -15,14 +15,10 @@ State-of-the-art local audio transcription with speaker diarization for macOS.
 
 ## Install
 
-```bash
-brew install scribe
-```
-
-Or build from source:
+Build from source (Homebrew formula coming soon):
 
 ```bash
-git clone https://github.com/your-org/scribe.git
+git clone https://github.com/theam/scribe.git
 cd scribe
 swift build -c release
 cp .build/release/scribe /usr/local/bin/
@@ -147,4 +143,4 @@ scribe is built on the shoulders of excellent open-source projects:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — Copyright 2026 The Agile Monkeys Inc. See [LICENSE](LICENSE).
