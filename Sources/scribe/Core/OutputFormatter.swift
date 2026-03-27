@@ -44,7 +44,7 @@ enum OutputFormatter {
         for result in results {
             for segment in result.segments {
                 let timestamp = formatTimestamp(segment.start)
-                lines.append("[\(timestamp)] \(segment.text.trimmingCharacters(in: .whitespaces))")
+                lines.append("[\(timestamp)] \(cleanText(segment.text))")
             }
         }
         return lines.joined(separator: "\n")
@@ -56,7 +56,7 @@ enum OutputFormatter {
             for segment in group {
                 let timestamp = formatTimestamp(segment.startTime)
                 let speaker = speakerLabel(segment.speaker)
-                let text = segment.transcription?.text.trimmingCharacters(in: .whitespaces) ?? ""
+                let text = cleanText(segment.transcription?.text ?? "") ?? ""
                 if !text.isEmpty {
                     lines.append("[\(timestamp)] \(speaker): \(text)")
                 }
@@ -101,7 +101,7 @@ enum OutputFormatter {
                     var dict: [String: Any] = [
                         "start": segment.start,
                         "end": segment.end,
-                        "text": segment.text.trimmingCharacters(in: .whitespaces),
+                        "text": cleanText(segment.text),
                     ]
                     if let words = segment.words, !words.isEmpty {
                         dict["words"] = words.map { word in
@@ -144,7 +144,7 @@ enum OutputFormatter {
         if let speakerSegments = speakerSegments {
             for group in speakerSegments {
                 for segment in group {
-                    let text = segment.transcription?.text.trimmingCharacters(in: .whitespaces) ?? ""
+                    let text = cleanText(segment.transcription?.text ?? "") ?? ""
                     guard !text.isEmpty else { continue }
                     let start = formatSRTTimestamp(segment.startTime)
                     let end = formatSRTTimestamp(segment.endTime)
@@ -161,7 +161,7 @@ enum OutputFormatter {
                 for segment in result.segments {
                     let start = formatSRTTimestamp(segment.start)
                     let end = formatSRTTimestamp(segment.end)
-                    let text = segment.text.trimmingCharacters(in: .whitespaces)
+                    let text = cleanText(segment.text)
                     lines.append("\(index)")
                     lines.append("\(start) --> \(end)")
                     lines.append(text)
@@ -182,7 +182,7 @@ enum OutputFormatter {
         if let speakerSegments = speakerSegments {
             for group in speakerSegments {
                 for segment in group {
-                    let text = segment.transcription?.text.trimmingCharacters(in: .whitespaces) ?? ""
+                    let text = cleanText(segment.transcription?.text ?? "") ?? ""
                     guard !text.isEmpty else { continue }
                     let start = formatVTTTimestamp(segment.startTime)
                     let end = formatVTTTimestamp(segment.endTime)
@@ -197,7 +197,7 @@ enum OutputFormatter {
                 for segment in result.segments {
                     let start = formatVTTTimestamp(segment.start)
                     let end = formatVTTTimestamp(segment.end)
-                    let text = segment.text.trimmingCharacters(in: .whitespaces)
+                    let text = cleanText(segment.text)
                     lines.append("\(start) --> \(end)")
                     lines.append(text)
                     lines.append("")
@@ -209,6 +209,14 @@ enum OutputFormatter {
     }
 
     // MARK: - Helpers
+
+    /// Strip Whisper special tokens from text (e.g., <|startoftranscript|>, <|en|>, <|0.00|>)
+    private static func cleanText(_ text: String) -> String {
+        // Remove all <|...|> tokens
+        let pattern = "<\\|[^|]*\\|>"
+        let cleaned = text.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        return cleaned.trimmingCharacters(in: .whitespaces)
+    }
 
     private static func speakerLabel(_ info: SpeakerInfo) -> String {
         switch info {

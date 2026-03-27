@@ -20,8 +20,8 @@ struct Transcribe: AsyncParsableCommand {
     @Option(name: .long, help: "Output format: txt, json, srt, vtt.")
     var format: OutputFormat = .txt
 
-    @Option(name: .long, help: "Whisper model to use.")
-    var model: String = "large-v3-turbo"
+    @Option(name: .long, help: "Whisper model to use (e.g., large-v3, large-v3-turbo, small, tiny).")
+    var model: String = "large-v3-v20240930_turbo_632MB"
 
     @Option(name: .long, help: "Language code (auto-detect if not specified).")
     var language: String?
@@ -43,11 +43,12 @@ struct Transcribe: AsyncParsableCommand {
         }
 
         // Initialize WhisperKit
-        let whisperKit = try await WhisperKit(
+        let config = WhisperKitConfig(
             model: model,
             verbose: verbose,
             logLevel: verbose ? .debug : .error
         )
+        let whisperKit = try await WhisperKit(config)
 
         if verbose {
             log("Transcribing '\(audioFile)'...")
