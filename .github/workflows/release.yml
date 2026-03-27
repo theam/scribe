@@ -20,7 +20,6 @@ jobs:
         run: |
           VERSION=$(sed -n 's/.*version: "\([^"]*\)".*/\1/p' Sources/scribe/ScribeCLI.swift)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
           if git rev-parse "v$VERSION" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Tag v$VERSION already exists, skipping release"
@@ -65,36 +64,31 @@ jobs:
             echo "TAP_TOKEN not set, skipping Homebrew tap update"
             exit 0
           fi
-
           VERSION="${{ steps.version.outputs.version }}"
           SHA256=$(awk '{print $1}' sha256.txt)
           URL="https://github.com/theam/scribe/releases/download/v${VERSION}/scribe-${VERSION}-macos-arm64.tar.gz"
-
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/theam/homebrew-tap.git" tap-repo
           cd tap-repo
+          python3 -c "
+          formula = '''class Scribe < Formula
+            desc \"State-of-the-art local audio transcription with speaker diarization for macOS\"
+            homepage \"https://github.com/theam/scribe\"
+            url \"${URL}\"
+            sha256 \"${SHA256}\"
+            license \"Apache-2.0\"
 
-          cat > Formula/scribe.rb << 'ENDOFFORMULA'
-class Scribe < Formula
-  desc "State-of-the-art local audio transcription with speaker diarization for macOS"
-  homepage "https://github.com/theam/scribe"
-  url "RELEASE_URL"
-  sha256 "RELEASE_SHA256"
-  license "Apache-2.0"
+            def install
+              bin.install \"scribe-macos\" => \"scribe\"
+            end
 
-  def install
-    bin.install "scribe-macos" => "scribe"
-  end
-
-  test do
-    assert_match "scribe", shell_output("#{bin}/scribe --version")
-  end
-end
-ENDOFFORMULA
-
-          # Replace placeholders with actual values
-          sed -i '' "s|RELEASE_URL|${URL}|" Formula/scribe.rb
-          sed -i '' "s|RELEASE_SHA256|${SHA256}|" Formula/scribe.rb
-
+            test do
+              assert_match \"scribe\", shell_output(\"#\{bin\}/scribe --version\")
+            end
+          end
+          '''
+          with open('Formula/scribe.rb', 'w') as f:
+              f.write(formula)
+          "
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/scribe.rb
