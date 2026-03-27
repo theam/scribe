@@ -20,8 +20,8 @@ struct Transcribe: AsyncParsableCommand {
     @Option(name: .long, help: "Output format: txt, json, srt, vtt.")
     var format: OutputFormat = .txt
 
-    @Option(name: .long, help: "Whisper model to use (e.g., large-v3, large-v3-turbo, small, tiny).")
-    var model: String = "large-v3-v20240930_turbo_632MB"
+    @Option(name: .long, help: "Whisper model to use (e.g., large-v3-turbo, large-v3, small, tiny).")
+    var model: String = "large-v3-turbo"
 
     @Option(name: .long, help: "Language code (auto-detect if not specified).")
     var language: String?
@@ -42,9 +42,10 @@ struct Transcribe: AsyncParsableCommand {
             log("Loading model '\(model)'...")
         }
 
-        // Initialize WhisperKit
+        // Initialize WhisperKit — map friendly names to HuggingFace folder names
+        let resolvedModel = Self.resolveModelName(model)
         let config = WhisperKitConfig(
-            model: model,
+            model: resolvedModel,
             verbose: verbose,
             logLevel: verbose ? .debug : .error
         )
@@ -102,13 +103,29 @@ struct Transcribe: AsyncParsableCommand {
                 log("Written to \(outputPath)")
             }
         } else {
-            print(formatted)
+            print(formatted, terminator: "")
+            // Ensure stdout is flushed before writing to stderr
+            fflush(stdout)
         }
 
         if verbose {
             let totalElapsed = Date().timeIntervalSince(startTime)
             log(String(format: "Total time: %.1fs", totalElapsed))
         }
+    }
+
+    /// Map friendly model names to HuggingFace folder names.
+    private static func resolveModelName(_ name: String) -> String {
+        let mapping: [String: String] = [
+            "large-v3-turbo": "openai_whisper-large-v3-v20240930_turbo_632MB",
+            "large-v3": "openai_whisper-large-v3_947MB",
+            "medium": "openai_whisper-medium",
+            "small": "openai_whisper-small",
+            "base": "openai_whisper-base",
+            "tiny": "openai_whisper-tiny",
+            "distil-large-v3": "distil-whisper_distil-large-v3",
+        ]
+        return mapping[name] ?? name
     }
 
     /// Write to stderr so it doesn't mix with stdout output.
