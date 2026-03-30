@@ -60,12 +60,39 @@ struct Stream: AsyncParsableCommand {
     // MARK: - Nemotron Engine (English-only, low latency)
 
     private func runNemotron() async throws {
-        if verbose { log("Initializing streaming ASR (Nemotron 560ms, English-only)...") }
+        log("Initializing streaming ASR (Nemotron 560ms, English-only)...")
+        log("Downloading model if needed (first run only, ~600MB)...")
 
         let engine = StreamingAsrEngineFactory.create(.nemotron560ms)
-        try await engine.loadModels()
 
-        if verbose { log("Models loaded.") }
+        // Try loading models — if it fails (partial download), clean cache and retry once
+        do {
+            try await engine.loadModels()
+        } catch {
+            log("Model loading failed: \(error.localizedDescription)")
+            log("Cleaning cache and retrying download...")
+
+            let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+                .appendingPathComponent("FluidAudio/Models/nemotron-streaming")
+            try? FileManager.default.removeItem(at: cacheDir)
+
+            let freshEngine = StreamingAsrEngineFactory.create(.nemotron560ms)
+            try await freshEngine.loadModels()
+            // If this also fails, the error propagates naturally
+
+            // Use the fresh engine — but we can't reassign `engine` (let binding),
+            // so we just recurse. The cache is now clean, so it will work.
+            log("Retry successful.")
+            // Re-run with clean state
+            try await runNemotronWithEngine(freshEngine)
+            return
+        }
+
+        log("Models loaded.")
+        try await runNemotronWithEngine(engine)
+    }
+
+    private func runNemotronWithEngine(_ engine: any StreamingAsrEngine) async throws {
 
         let audioEngine = AVAudioEngine()
         let inputNode = audioEngine.inputNode
@@ -139,12 +166,13 @@ struct Stream: AsyncParsableCommand {
     // MARK: - SlidingWindow Engine (Multilingual, default)
 
     private func runSlidingWindow() async throws {
-        if verbose { log("Initializing streaming ASR (Parakeet TDT v3, multilingual)...") }
+        log("Initializing streaming ASR (Parakeet TDT v3, multilingual)...")
+        log("Downloading model if needed (first run only, ~600MB)...")
 
         let streamManager = SlidingWindowAsrManager(config: .streaming)
         try await streamManager.start(source: .microphone)
 
-        if verbose { log("Models loaded.") }
+        log("Models loaded.")
 
         let audioEngine = AVAudioEngine()
         let inputNode = audioEngine.inputNode
