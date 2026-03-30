@@ -6,12 +6,12 @@ State-of-the-art local audio transcription with speaker diarization for macOS.
 
 ## Features
 
-- **Transcription** — Accurate speech-to-text powered by OpenAI Whisper (via WhisperKit)
-- **Speaker diarization** — Identify who said what, powered by pyannote (via SpeakerKit)
-- **Apple Silicon optimized** — Runs on CoreML and the Apple Neural Engine
+- **Transcription** — Accurate speech-to-text powered by NVIDIA Parakeet TDT v3 (via FluidAudio CoreML)
+- **Speaker diarization** — Identify who said what, powered by pyannote (via FluidAudio CoreML)
+- **Apple Silicon optimized** — Runs on CoreML and the Apple Neural Engine at 130x real-time
 - **Multiple output formats** — Plain text, JSON (with word timestamps), SRT, VTT
-- **99 languages** — Supports all languages that Whisper supports
-- **Fast** — Processes audio faster than real-time on Apple Silicon
+- **25 European languages** — English, Spanish, French, German, Italian, Portuguese, Russian, and more
+- **Fast** — Transcribes a 4-minute recording in under 2 seconds
 
 ## Install
 
@@ -42,11 +42,13 @@ scribe transcribe meeting.wav
 scribe transcribe meeting.wav --diarize
 ```
 
-### Specify number of speakers (improves accuracy)
+### Specify number of speakers (recommended for best diarization)
 
 ```bash
 scribe transcribe meeting.wav --diarize --speakers 4
 ```
+
+> **Tip:** Providing the expected number of speakers with `--speakers` significantly improves diarization accuracy. Without it, the automatic speaker count detection works well for most recordings but may slightly over- or under-segment when voices are similar. If you know how many people were in the meeting, always pass `--speakers`.
 
 ### Output formats
 
@@ -63,14 +65,6 @@ scribe transcribe meeting.wav --format vtt    # WebVTT subtitles
 scribe transcribe meeting.wav --format json --output transcript.json
 ```
 
-### Choose a model
-
-```bash
-scribe transcribe meeting.wav --model large-v3         # best accuracy
-scribe transcribe meeting.wav --model large-v3-turbo   # best speed/accuracy (default)
-scribe transcribe meeting.wav --model small             # fastest, lower accuracy
-```
-
 ### Force a language
 
 ```bash
@@ -78,12 +72,10 @@ scribe transcribe meeting.wav --language es    # Spanish
 scribe transcribe meeting.wav --language fr    # French
 ```
 
-### Manage models
+### Pre-download models
 
 ```bash
-scribe models list                       # see available/downloaded models
-scribe models download large-v3-turbo    # download a model
-scribe models remove large-v3            # remove a downloaded model
+scribe models download all    # download ASR + diarization models for offline use
 ```
 
 ## Output Examples
@@ -91,8 +83,10 @@ scribe models remove large-v3            # remove a downloaded model
 ### Plain text with diarization
 
 ```
-[00:00:12] Speaker 1: Hello everyone, welcome to the meeting.
-[00:00:18] Speaker 2: Thanks for joining. Let's start with the agenda.
+[00:03] Speaker 1: Hello, how are you?
+[00:06] Speaker 1: I forgot a few points.
+[00:27] Speaker 2: Let's see if Claude is right about you.
+[00:32] Speaker 3: Oh my gosh, here comes the song. My favorite.
 ```
 
 ### JSON
@@ -100,49 +94,53 @@ scribe models remove large-v3            # remove a downloaded model
 ```json
 {
   "metadata": {
-    "duration": 3612.5,
+    "duration": 226.1,
     "diarization": true
   },
   "segments": [
     {
-      "start": 12.0,
-      "end": 16.5,
-      "text": "Hello everyone, welcome to the meeting.",
+      "start": 3.2,
+      "end": 4.7,
+      "text": "Hello, how are you?",
       "speaker": "Speaker 1",
       "words": [
-        { "start": 12.0, "end": 12.4, "text": "Hello" }
+        { "start": 3.2, "end": 3.6, "text": "Hello," },
+        { "start": 3.6, "end": 3.9, "text": "how" },
+        { "start": 3.9, "end": 4.2, "text": "are" },
+        { "start": 4.2, "end": 4.7, "text": "you?" }
       ]
     }
   ]
 }
 ```
 
+## Performance
+
+Tested on Apple Silicon (M-series):
+
+| Task | Speed | Example |
+|------|-------|---------|
+| Transcription only | ~130x real-time | 4-min file in 1.7s |
+| Transcription + diarization | ~30x real-time | 4-min file in 7.5s |
+
+Models are downloaded automatically on first use (~600MB for ASR, ~50MB for diarization).
+
 ## Requirements
 
 - macOS 14 (Sonoma) or later
-- Apple Silicon (M1 or later) recommended — Intel Macs fall back to CPU inference
+- Apple Silicon (M1 or later)
 
-## Models
+## Supported Languages
 
-The default model (`large-v3-turbo`, ~632MB) is downloaded automatically on first use. Other models can be downloaded with `scribe models download`.
-
-| Model | Size | Speed | Accuracy | Languages |
-|-------|------|-------|----------|-----------|
-| tiny | ~75MB | Fastest | Lower | 99 |
-| base | ~142MB | Very fast | Fair | 99 |
-| small | ~466MB | Fast | Good | 99 |
-| medium | ~1.5GB | Moderate | Very good | 99 |
-| large-v3-turbo | ~632MB | **Fast** | **Very good** | 99 |
-| large-v3 | ~3.1GB | Slower | Best | 99 |
+Bulgarian, Croatian, Czech, Danish, Dutch, English, Estonian, Finnish, French, German, Greek, Hungarian, Italian, Latvian, Lithuanian, Maltese, Polish, Portuguese, Romanian, Russian, Slovak, Slovenian, Spanish, Swedish, Ukrainian.
 
 ## Acknowledgments
 
 scribe is built on the shoulders of excellent open-source projects:
 
-- **[OpenAI Whisper](https://github.com/openai/whisper)** (Apache 2.0) — The speech recognition model that powers transcription
-- **[WhisperKit](https://github.com/argmaxinc/WhisperKit)** (MIT) by Argmax — CoreML implementation of Whisper for Apple Silicon
-- **[SpeakerKit](https://github.com/argmaxinc/WhisperKit)** (MIT) by Argmax — CoreML speaker diarization
-- **[pyannote.audio](https://github.com/pyannote/pyannote-audio)** (MIT) by Herve Bredin — The diarization model architecture that SpeakerKit builds on
+- **[NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)** (CC-BY-4.0) — The speech recognition model that powers transcription
+- **[FluidAudio](https://github.com/FluidInference/FluidAudio)** (Apache 2.0) by FluidInference — CoreML speech processing SDK for Apple Silicon
+- **[pyannote.audio](https://github.com/pyannote/pyannote-audio)** (MIT) by Herve Bredin — The diarization model architecture
 - **[swift-argument-parser](https://github.com/apple/swift-argument-parser)** (Apache 2.0) by Apple — CLI argument parsing
 
 ## License
