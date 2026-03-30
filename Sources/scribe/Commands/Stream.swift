@@ -3,6 +3,34 @@ import AVFoundation
 import FluidAudio
 import Foundation
 
+/// Thread-safe state tracker for streaming output.
+private actor StreamState {
+    var lastPartialText = ""
+    var lastOutputText = ""
+
+    func shouldEmitPartial(_ text: String) -> Bool {
+        guard text != lastPartialText else { return false }
+        lastPartialText = text
+        return true
+    }
+
+    func getNewText(_ fullTranscript: String) -> String? {
+        let text = fullTranscript.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty, text != lastOutputText else { return nil }
+
+        let newText: String
+        if text.hasPrefix(lastOutputText) {
+            newText = String(text.dropFirst(lastOutputText.count)).trimmingCharacters(in: .whitespaces)
+        } else {
+            newText = text
+        }
+
+        guard !newText.isEmpty else { return nil }
+        lastOutputText = text
+        return newText
+    }
+}
+
 struct Stream: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Stream live audio transcription from microphone."
@@ -18,13 +46,13 @@ struct Stream: AsyncParsableCommand {
     var verbose: Bool = false
 
     func run() async throws {
-        if verbose { log("Initializing streaming ASR (Parakeet)...") }
+        if verbose { log("Initializing streaming ASR (Nemotron 560ms)...") }
 
-        // Use the library's streaming config (11s chunks + 1s hypothesis updates)
-        let streamManager = SlidingWindowAsrManager(config: .streaming)
-        try await streamManager.start(source: .microphone)
+        let engine = StreamingAsrEngineFactory.create(.nemotron560ms)
+        try await engine.loadModels()
 
-        // Set up microphone capture
+        if verbose { log("Models loaded.") }
+
         let audioEngine = AVAudioEngine()
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -34,13 +62,42 @@ struct Stream: AsyncParsableCommand {
         }
 
         let startTime = Date()
+        let state = StreamState()
+        let fmt = format
         var outputFile: FileHandle? = nil
-        var lastConfirmedText = ""
-        var lastVolatileText = ""
 
         if let outputPath = output {
             FileManager.default.createFile(atPath: outputPath, contents: nil)
             outputFile = FileHandle(forWritingAtPath: outputPath)
+        }
+
+        // Partial transcript callback — fires on every chunk (~560ms)
+        await engine.setPartialTranscriptCallback { partial in
+            let text = partial.trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { return }
+
+            Task {
+                guard await state.shouldEmitPartial(text) else { return }
+                let elapsed = Date().timeIntervalSince(startTime)
+
+                switch fmt {
+                case .text:
+                    let ts = formatStreamTimestamp(elapsed)
+                    let preview = String(text.suffix(100))
+                    FileHandle.standardError.write(Data("\r\u{1B}[K[\(ts)] \(preview)".utf8))
+                case .jsonl:
+                    let jsonObj: [String: Any] = [
+                        "time": round(elapsed * 10) / 10,
+                        "text": text,
+                        "partial": true,
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
+                       let jsonStr = String(data: data, encoding: .utf8) {
+                        print(jsonStr)
+                        fflush(stdout)
+                    }
+                }
+            }
         }
 
         signal(SIGINT) { _ in
@@ -51,104 +108,70 @@ struct Stream: AsyncParsableCommand {
         // Install tap on microphone
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
             nonisolated(unsafe) let buf = buffer
-            streamManager.streamAudio(buf)
+            do {
+                try engine.appendAudio(buf)
+            } catch {
+                // Non-fatal
+            }
         }
 
         try audioEngine.start()
         log("Listening... (press Ctrl+C to stop)")
 
-        // Read transcription updates
-        let updates = await streamManager.transcriptionUpdates
-        for await update in updates {
-            let text = update.text.trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty else { continue }
+        // Processing loop
+        while true {
+            try await engine.processBufferedAudio()
 
-            let elapsed = Date().timeIntervalSince(startTime)
+            let transcript = await engine.getPartialTranscript()
+            if let newText = await state.getNewText(transcript) {
+                let elapsed = Date().timeIntervalSince(startTime)
+                let line: String
 
-            if update.isConfirmed {
-                // Confirmed: stable, final text — print as a permanent line
-                guard text != lastConfirmedText else { continue }
-                lastConfirmedText = text
-                lastVolatileText = "" // reset volatile tracking
+                switch format {
+                case .text:
+                    let ts = formatStreamTimestamp(elapsed)
+                    FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
+                    line = "[\(ts)] \(newText)"
+                case .jsonl:
+                    let jsonObj: [String: Any] = [
+                        "time": round(elapsed * 10) / 10,
+                        "text": newText,
+                        "partial": false,
+                    ]
+                    if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
+                       let jsonStr = String(data: data, encoding: .utf8) {
+                        line = jsonStr
+                    } else {
+                        continue
+                    }
+                }
 
-                let line = formatLine(text: text, elapsed: elapsed, confirmed: true)
                 print(line)
                 fflush(stdout)
 
                 if let file = outputFile {
                     file.write(Data((line + "\n").utf8))
                 }
-            } else {
-                // Volatile: hypothesis, may change — show as ephemeral line
-                guard text != lastVolatileText else { continue }
-                lastVolatileText = text
-
-                switch format {
-                case .text:
-                    // Overwrite current line with \r for live feel
-                    let ts = formatTimestamp(elapsed)
-                    let preview = String(text.suffix(80))
-                    let line = "\r[\(ts)] \(preview)"
-                    FileHandle.standardError.write(Data(line.utf8))
-                case .jsonl:
-                    // In JSONL mode, emit volatile updates too (marked as unconfirmed)
-                    let line = formatLine(text: text, elapsed: elapsed, confirmed: false)
-                    print(line)
-                    fflush(stdout)
-                }
             }
-        }
 
-        // Clean shutdown
-        audioEngine.stop()
-        inputNode.removeTap(onBus: 0)
-        _ = try await streamManager.finish()
-
-        let totalElapsed = Date().timeIntervalSince(startTime)
-        FileHandle.standardError.write(Data("\n--- Stream ended ---\n".utf8))
-        FileHandle.standardError.write(Data(String(format: "Duration: %dm %ds\n",
-            Int(totalElapsed) / 60, Int(totalElapsed) % 60).utf8))
-
-        if let outputPath = output {
-            FileHandle.standardError.write(Data("Saved to: \(outputPath)\n".utf8))
-        }
-
-        outputFile?.closeFile()
-    }
-
-    private func formatLine(text: String, elapsed: Double, confirmed: Bool) -> String {
-        switch format {
-        case .text:
-            let ts = formatTimestamp(elapsed)
-            return "[\(ts)] \(text)"
-        case .jsonl:
-            let jsonObj: [String: Any] = [
-                "time": round(elapsed * 10) / 10,
-                "text": text,
-                "confirmed": confirmed,
-            ]
-            if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
-               let jsonStr = String(data: data, encoding: .utf8) {
-                return jsonStr
-            }
-            return "{\"text\":\"\(text)\"}"
+            try await Task.sleep(nanoseconds: 50_000_000) // 50ms polling
         }
     }
 
     private func log(_ message: String) {
         FileHandle.standardError.write(Data("[scribe] \(message)\n".utf8))
     }
+}
 
-    private func formatTimestamp(_ seconds: Double) -> String {
-        let totalSeconds = Int(seconds)
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
-        let secs = totalSeconds % 60
-        if hours > 0 {
-            return String(format: "%02d:%02d:%02d", hours, minutes, secs)
-        }
-        return String(format: "%02d:%02d", minutes, secs)
+private func formatStreamTimestamp(_ seconds: Double) -> String {
+    let totalSeconds = Int(seconds)
+    let hours = totalSeconds / 3600
+    let minutes = (totalSeconds % 3600) / 60
+    let secs = totalSeconds % 60
+    if hours > 0 {
+        return String(format: "%02d:%02d:%02d", hours, minutes, secs)
     }
+    return String(format: "%02d:%02d", minutes, secs)
 }
 
 enum StreamOutputFormat: String, ExpressibleByArgument, CaseIterable, Sendable {
