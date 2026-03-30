@@ -3,31 +3,38 @@ import AVFoundation
 import FluidAudio
 import Foundation
 
-/// Thread-safe state tracker for streaming output.
+/// Thread-safe state for tracking incremental transcript output.
 private actor StreamState {
-    var lastPartialText = ""
-    var lastOutputText = ""
+    private var lastFullTranscript = ""
+    private var printedLength = 0
 
-    func shouldEmitPartial(_ text: String) -> Bool {
-        guard text != lastPartialText else { return false }
-        lastPartialText = text
-        return true
-    }
-
+    /// Given the full accumulated transcript, return only the new portion.
+    /// Handles model revisions by finding the longest common prefix.
     func getNewText(_ fullTranscript: String) -> String? {
         let text = fullTranscript.trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty, text != lastOutputText else { return nil }
+        guard !text.isEmpty else { return nil }
+        guard text != lastFullTranscript else { return nil }
 
-        let newText: String
-        if text.hasPrefix(lastOutputText) {
-            newText = String(text.dropFirst(lastOutputText.count)).trimmingCharacters(in: .whitespaces)
-        } else {
-            newText = text
+        lastFullTranscript = text
+
+        // Find how much of the text we've already printed
+        if text.count > printedLength {
+            let newPortion = String(text.dropFirst(printedLength)).trimmingCharacters(in: .whitespaces)
+            if !newPortion.isEmpty {
+                printedLength = text.count
+                return newPortion
+            }
         }
 
-        guard !newText.isEmpty else { return nil }
-        lastOutputText = text
-        return newText
+        return nil
+    }
+
+    /// Get the live preview (last N chars of full transcript).
+    func getPreview(_ fullTranscript: String, maxLen: Int = 100) -> String? {
+        let text = fullTranscript.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        guard text != lastFullTranscript else { return nil }
+        return String(text.suffix(maxLen))
     }
 }
 
@@ -65,7 +72,6 @@ struct Stream: AsyncParsableCommand {
 
         let engine = StreamingAsrEngineFactory.create(.nemotron560ms)
 
-        // Try loading models — if it fails (partial download), clean cache and retry once
         do {
             try await engine.loadModels()
         } catch {
@@ -78,12 +84,7 @@ struct Stream: AsyncParsableCommand {
 
             let freshEngine = StreamingAsrEngineFactory.create(.nemotron560ms)
             try await freshEngine.loadModels()
-            // If this also fails, the error propagates naturally
-
-            // Use the fresh engine — but we can't reassign `engine` (let binding),
-            // so we just recurse. The cache is now clean, so it will work.
             log("Retry successful.")
-            // Re-run with clean state
             try await runNemotronWithEngine(freshEngine)
             return
         }
@@ -93,7 +94,6 @@ struct Stream: AsyncParsableCommand {
     }
 
     private func runNemotronWithEngine(_ engine: any StreamingAsrEngine) async throws {
-
         let audioEngine = AVAudioEngine()
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -112,29 +112,54 @@ struct Stream: AsyncParsableCommand {
             outputFile = FileHandle(forWritingAtPath: outputPath)
         }
 
-        await engine.setPartialTranscriptCallback { partial in
-            let text = partial.trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty else { return }
+        // Capture file handle for sendable closure
+        nonisolated(unsafe) let outFile = outputFile
 
+        // Partial callback — fires after each 560ms chunk with the full accumulated transcript.
+        // We diff to find new text and emit only the delta.
+        await engine.setPartialTranscriptCallback { fullTranscript in
             Task {
-                guard await state.shouldEmitPartial(text) else { return }
                 let elapsed = Date().timeIntervalSince(startTime)
 
                 switch fmt {
                 case .text:
-                    let ts = formatStreamTimestamp(elapsed)
-                    let preview = String(text.suffix(100))
-                    FileHandle.standardError.write(Data("\r\u{1B}[K[\(ts)] \(preview)".utf8))
+                    // Show live preview on stderr (ephemeral, overwritten)
+                    let preview = String(fullTranscript.trimmingCharacters(in: .whitespaces).suffix(100))
+                    if !preview.isEmpty {
+                        let ts = formatStreamTimestamp(elapsed)
+                        FileHandle.standardError.write(Data("\r\u{1B}[K[\(ts)] \(preview)".utf8))
+                    }
                 case .jsonl:
-                    let jsonObj: [String: Any] = [
-                        "time": round(elapsed * 10) / 10,
-                        "text": text,
-                        "partial": true,
-                    ]
-                    if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
-                       let jsonStr = String(data: data, encoding: .utf8) {
-                        print(jsonStr)
-                        fflush(stdout)
+                    break
+                }
+
+                // Emit new portion to stdout
+                if let newText = await state.getNewText(fullTranscript) {
+                    let ts = formatStreamTimestamp(elapsed)
+
+                    let line: String
+                    switch fmt {
+                    case .text:
+                        FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
+                        line = "[\(ts)] \(newText)"
+                    case .jsonl:
+                        let jsonObj: [String: Any] = [
+                            "time": round(elapsed * 10) / 10,
+                            "text": newText,
+                        ]
+                        if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
+                           let jsonStr = String(data: data, encoding: .utf8) {
+                            line = jsonStr
+                        } else {
+                            return
+                        }
+                    }
+
+                    print(line)
+                    fflush(stdout)
+
+                    if let file = outFile {
+                        file.write(Data((line + "\n").utf8))
                     }
                 }
             }
@@ -150,16 +175,10 @@ struct Stream: AsyncParsableCommand {
         try audioEngine.start()
         log("Listening (English, low latency)... press Ctrl+C to stop")
 
+        // Processing loop — drives the engine to process buffered audio
         while true {
             try await engine.processBufferedAudio()
-
-            let transcript = await engine.getPartialTranscript()
-            if let newText = await state.getNewText(transcript) {
-                let elapsed = Date().timeIntervalSince(startTime)
-                emitLine(text: newText, elapsed: elapsed, partial: false, outputFile: outputFile)
-            }
-
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
         }
     }
 
@@ -213,7 +232,7 @@ struct Stream: AsyncParsableCommand {
                 guard text != lastConfirmedText else { continue }
                 lastConfirmedText = text
                 lastVolatileText = ""
-                emitLine(text: text, elapsed: elapsed, partial: false, outputFile: outputFile)
+                emitLine(text: text, elapsed: elapsed, outputFile: outputFile)
             } else {
                 guard text != lastVolatileText else { continue }
                 lastVolatileText = text
@@ -224,7 +243,7 @@ struct Stream: AsyncParsableCommand {
                     let preview = String(text.suffix(100))
                     FileHandle.standardError.write(Data("\r\u{1B}[K[\(ts)] \(preview)".utf8))
                 case .jsonl:
-                    emitLine(text: text, elapsed: elapsed, partial: true, outputFile: nil)
+                    break
                 }
             }
         }
@@ -234,9 +253,9 @@ struct Stream: AsyncParsableCommand {
         _ = try await streamManager.finish()
     }
 
-    // MARK: - Shared Helpers
+    // MARK: - Helpers
 
-    private func emitLine(text: String, elapsed: Double, partial: Bool, outputFile: FileHandle?) {
+    private func emitLine(text: String, elapsed: Double, outputFile: FileHandle?) {
         let line: String
 
         switch format {
@@ -248,7 +267,6 @@ struct Stream: AsyncParsableCommand {
             let jsonObj: [String: Any] = [
                 "time": round(elapsed * 10) / 10,
                 "text": text,
-                "partial": partial,
             ]
             if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
                let jsonStr = String(data: data, encoding: .utf8) {
