@@ -8,9 +8,6 @@ struct Stream: AsyncParsableCommand {
         abstract: "Stream live audio transcription from microphone or system audio."
     )
 
-    @Flag(name: .long, help: "Capture microphone audio (default if no --source specified).")
-    var mic: Bool = false
-
     @Option(name: .long, help: "Output format: text or jsonl.")
     var format: StreamOutputFormat = .text
 
@@ -21,10 +18,18 @@ struct Stream: AsyncParsableCommand {
     var verbose: Bool = false
 
     func run() async throws {
-        // For now, mic is the default and only source
         if verbose { log("Initializing streaming ASR (Parakeet)...") }
 
-        let streamManager = SlidingWindowAsrManager(config: .streaming)
+        // Low-latency config: 3s chunks for fast output, 1s hypothesis for immediate feedback
+        let config = SlidingWindowAsrConfig(
+            chunkSeconds: 3.0,
+            hypothesisChunkSeconds: 1.0,
+            leftContextSeconds: 3.0,
+            rightContextSeconds: 0.5,
+            minContextForConfirmation: 3.0,
+            confirmationThreshold: 0.5
+        )
+        let streamManager = SlidingWindowAsrManager(config: config)
         try await streamManager.start(source: .microphone)
 
         // Set up microphone capture
@@ -34,13 +39,13 @@ struct Stream: AsyncParsableCommand {
 
         if verbose {
             log("Microphone: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) ch")
-            log("Listening... (press Ctrl+C to stop)")
         }
 
         // Track state for output
         let startTime = Date()
         var outputFile: FileHandle? = nil
         var utteranceCount = 0
+        var lastEmittedText = ""
 
         if let outputPath = output {
             FileManager.default.createFile(atPath: outputPath, contents: nil)
@@ -49,44 +54,40 @@ struct Stream: AsyncParsableCommand {
 
         // Set up signal handler for clean Ctrl+C
         signal(SIGINT) { _ in
+            FileHandle.standardError.write(Data("\n".utf8))
             Darwin.exit(0)
         }
 
         // Install tap on microphone — feed buffers to ASR
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
-            // nonisolated(unsafe) to cross sendability boundary — buffer is consumed immediately
             nonisolated(unsafe) let buf = buffer
             streamManager.streamAudio(buf)
         }
 
         try audioEngine.start()
-
-        if !verbose {
-            // Print a minimal status line to stderr
-            log("Listening... (press Ctrl+C to stop)")
-        }
+        log("Listening... (press Ctrl+C to stop)")
 
         // Read transcription updates
         let updates = await streamManager.transcriptionUpdates
         for await update in updates {
-            // Stream continues until Ctrl+C or stream ends
-
             let text = update.text.trimmingCharacters(in: .whitespaces)
             guard !text.isEmpty else { continue }
 
+            // Skip if this is the same text we already emitted (dedup)
+            guard text != lastEmittedText else { continue }
+            lastEmittedText = text
+
             utteranceCount += 1
             let elapsed = Date().timeIntervalSince(startTime)
-            let speaker = mic ? "You" : "Others"
 
             let line: String
             switch format {
             case .text:
                 let ts = formatTimestamp(elapsed)
-                line = "[\(ts)] \(speaker): \(text)"
+                line = "[\(ts)] \(text)"
             case .jsonl:
                 let jsonObj: [String: Any] = [
                     "time": round(elapsed * 10) / 10,
-                    "speaker": speaker,
                     "text": text,
                     "confirmed": update.isConfirmed,
                 ]
@@ -109,11 +110,10 @@ struct Stream: AsyncParsableCommand {
         // Clean shutdown
         audioEngine.stop()
         inputNode.removeTap(onBus: 0)
-        let finalText = try await streamManager.finish()
+        _ = try await streamManager.finish()
 
         let totalElapsed = Date().timeIntervalSince(startTime)
 
-        // Print summary to stderr
         FileHandle.standardError.write(Data("\n--- Stream ended ---\n".utf8))
         FileHandle.standardError.write(Data(String(format: "Duration: %dm %ds\n",
             Int(totalElapsed) / 60, Int(totalElapsed) % 60).utf8))
@@ -141,8 +141,6 @@ struct Stream: AsyncParsableCommand {
         return String(format: "%02d:%02d", minutes, secs)
     }
 }
-
-// MARK: - Stream Output Format
 
 enum StreamOutputFormat: String, ExpressibleByArgument, CaseIterable, Sendable {
     case text, jsonl
