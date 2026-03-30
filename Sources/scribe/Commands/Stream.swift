@@ -5,7 +5,7 @@ import Foundation
 
 struct Stream: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Stream live audio transcription from microphone or system audio."
+        abstract: "Stream live audio transcription from microphone."
     )
 
     @Option(name: .long, help: "Output format: text or jsonl.")
@@ -20,16 +20,8 @@ struct Stream: AsyncParsableCommand {
     func run() async throws {
         if verbose { log("Initializing streaming ASR (Parakeet)...") }
 
-        // Low-latency config: 3s chunks for fast output, 1s hypothesis for immediate feedback
-        let config = SlidingWindowAsrConfig(
-            chunkSeconds: 3.0,
-            hypothesisChunkSeconds: 1.0,
-            leftContextSeconds: 3.0,
-            rightContextSeconds: 0.5,
-            minContextForConfirmation: 3.0,
-            confirmationThreshold: 0.5
-        )
-        let streamManager = SlidingWindowAsrManager(config: config)
+        // Use the library's streaming config (11s chunks + 1s hypothesis updates)
+        let streamManager = SlidingWindowAsrManager(config: .streaming)
         try await streamManager.start(source: .microphone)
 
         // Set up microphone capture
@@ -41,24 +33,22 @@ struct Stream: AsyncParsableCommand {
             log("Microphone: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) ch")
         }
 
-        // Track state for output
         let startTime = Date()
         var outputFile: FileHandle? = nil
-        var utteranceCount = 0
-        var lastEmittedText = ""
+        var lastConfirmedText = ""
+        var lastVolatileText = ""
 
         if let outputPath = output {
             FileManager.default.createFile(atPath: outputPath, contents: nil)
             outputFile = FileHandle(forWritingAtPath: outputPath)
         }
 
-        // Set up signal handler for clean Ctrl+C
         signal(SIGINT) { _ in
             FileHandle.standardError.write(Data("\n".utf8))
             Darwin.exit(0)
         }
 
-        // Install tap on microphone — feed buffers to ASR
+        // Install tap on microphone
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
             nonisolated(unsafe) let buf = buffer
             streamManager.streamAudio(buf)
@@ -73,37 +63,39 @@ struct Stream: AsyncParsableCommand {
             let text = update.text.trimmingCharacters(in: .whitespaces)
             guard !text.isEmpty else { continue }
 
-            // Skip if this is the same text we already emitted (dedup)
-            guard text != lastEmittedText else { continue }
-            lastEmittedText = text
-
-            utteranceCount += 1
             let elapsed = Date().timeIntervalSince(startTime)
 
-            let line: String
-            switch format {
-            case .text:
-                let ts = formatTimestamp(elapsed)
-                line = "[\(ts)] \(text)"
-            case .jsonl:
-                let jsonObj: [String: Any] = [
-                    "time": round(elapsed * 10) / 10,
-                    "text": text,
-                    "confirmed": update.isConfirmed,
-                ]
-                if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
-                   let jsonStr = String(data: data, encoding: .utf8) {
-                    line = jsonStr
-                } else {
-                    continue
+            if update.isConfirmed {
+                // Confirmed: stable, final text — print as a permanent line
+                guard text != lastConfirmedText else { continue }
+                lastConfirmedText = text
+                lastVolatileText = "" // reset volatile tracking
+
+                let line = formatLine(text: text, elapsed: elapsed, confirmed: true)
+                print(line)
+                fflush(stdout)
+
+                if let file = outputFile {
+                    file.write(Data((line + "\n").utf8))
                 }
-            }
+            } else {
+                // Volatile: hypothesis, may change — show as ephemeral line
+                guard text != lastVolatileText else { continue }
+                lastVolatileText = text
 
-            print(line)
-            fflush(stdout)
-
-            if let file = outputFile {
-                file.write(Data((line + "\n").utf8))
+                switch format {
+                case .text:
+                    // Overwrite current line with \r for live feel
+                    let ts = formatTimestamp(elapsed)
+                    let preview = String(text.suffix(80))
+                    let line = "\r[\(ts)] \(preview)"
+                    FileHandle.standardError.write(Data(line.utf8))
+                case .jsonl:
+                    // In JSONL mode, emit volatile updates too (marked as unconfirmed)
+                    let line = formatLine(text: text, elapsed: elapsed, confirmed: false)
+                    print(line)
+                    fflush(stdout)
+                }
             }
         }
 
@@ -113,17 +105,34 @@ struct Stream: AsyncParsableCommand {
         _ = try await streamManager.finish()
 
         let totalElapsed = Date().timeIntervalSince(startTime)
-
         FileHandle.standardError.write(Data("\n--- Stream ended ---\n".utf8))
         FileHandle.standardError.write(Data(String(format: "Duration: %dm %ds\n",
             Int(totalElapsed) / 60, Int(totalElapsed) % 60).utf8))
-        FileHandle.standardError.write(Data("Utterances: \(utteranceCount)\n".utf8))
 
         if let outputPath = output {
             FileHandle.standardError.write(Data("Saved to: \(outputPath)\n".utf8))
         }
 
         outputFile?.closeFile()
+    }
+
+    private func formatLine(text: String, elapsed: Double, confirmed: Bool) -> String {
+        switch format {
+        case .text:
+            let ts = formatTimestamp(elapsed)
+            return "[\(ts)] \(text)"
+        case .jsonl:
+            let jsonObj: [String: Any] = [
+                "time": round(elapsed * 10) / 10,
+                "text": text,
+                "confirmed": confirmed,
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
+               let jsonStr = String(data: data, encoding: .utf8) {
+                return jsonStr
+            }
+            return "{\"text\":\"\(text)\"}"
+        }
     }
 
     private func log(_ message: String) {
