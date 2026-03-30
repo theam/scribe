@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 
 import PackageDescription
 
@@ -11,17 +11,17 @@ let package = Package(
         .executable(name: "scribe", targets: ["scribe"])
     ],
     dependencies: [
-        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.17.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
     ],
     targets: [
         .executableTarget(
             name: "scribe",
             dependencies: [
-                .product(name: "WhisperKit", package: "WhisperKit"),
-                .product(name: "SpeakerKit", package: "WhisperKit"),
+                .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
-    ]
+    ],
+    cxxLanguageStandard: .cxx17
 )

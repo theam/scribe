@@ -1,130 +1,195 @@
+import FluidAudio
 import Foundation
-import SpeakerKit
-import WhisperKit
 
 /// Formats transcription results into various output formats.
 enum OutputFormatter {
 
     static func format(
-        results: [TranscriptionResult],
-        diarization: DiarizationResult?,
+        asrResult: ASRResult,
+        diarization: [DiarizationSegment]?,
+        duration: Double,
         format: OutputFormat
     ) -> String {
-        // If we have diarization, merge speaker info into segments
-        let speakerSegments: [[SpeakerSegment]]?
-        if let diarization = diarization {
-            speakerSegments = diarization.addSpeakerInfo(to: results)
-        } else {
-            speakerSegments = nil
-        }
+        // Build segments from token timings or fall back to full text
+        let segments = buildSegments(asrResult: asrResult, diarization: diarization)
 
         switch format {
         case .txt:
-            return formatText(results: results, speakerSegments: speakerSegments)
+            return formatText(segments: segments)
         case .json:
-            return formatJSON(results: results, speakerSegments: speakerSegments, hasDiarization: diarization != nil)
+            return formatJSON(segments: segments, duration: duration, hasDiarization: diarization != nil)
         case .srt:
-            return formatSRT(results: results, speakerSegments: speakerSegments)
+            return formatSRT(segments: segments)
         case .vtt:
-            return formatVTT(results: results, speakerSegments: speakerSegments)
+            return formatVTT(segments: segments)
         }
+    }
+
+    // MARK: - Segment Building
+
+    private struct Word {
+        let start: Double
+        let end: Double
+        let text: String
+    }
+
+    private struct Segment {
+        let start: Double
+        let end: Double
+        let text: String
+        let speaker: String?
+        let words: [Word]
+    }
+
+    /// Merge BPE/SentencePiece tokens into whole words.
+    /// Convention: a token starting with a space begins a new word; others continue the previous.
+    private static func mergeTokensIntoWords(timings: [TokenTiming]) -> [Word] {
+        var words: [Word] = []
+        var currentText = ""
+        var wordStart: Double = 0
+        var wordEnd: Double = 0
+
+        for timing in timings {
+            let token = timing.token
+            if token.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+
+            let startsNewWord = token.hasPrefix(" ") || words.isEmpty && currentText.isEmpty
+
+            if startsNewWord && !currentText.isEmpty {
+                // Flush previous word
+                let trimmed = currentText.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty {
+                    words.append(Word(start: wordStart, end: wordEnd, text: trimmed))
+                }
+                currentText = ""
+            }
+
+            if currentText.isEmpty {
+                wordStart = timing.startTime
+            }
+            currentText += token
+            wordEnd = timing.endTime
+        }
+
+        // Flush last word
+        let trimmed = currentText.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty {
+            words.append(Word(start: wordStart, end: wordEnd, text: trimmed))
+        }
+
+        return words
+    }
+
+    private static func buildSegments(asrResult: ASRResult, diarization: [DiarizationSegment]?) -> [Segment] {
+        guard let timings = asrResult.tokenTimings, !timings.isEmpty else {
+            return [Segment(
+                start: 0,
+                end: asrResult.duration,
+                text: cleanText(asrResult.text),
+                speaker: nil,
+                words: []
+            )]
+        }
+
+        let allWords = mergeTokensIntoWords(timings: timings)
+
+        // Group words into sentence-like segments (split on sentence-ending punctuation)
+        var segments: [Segment] = []
+        var currentWords: [Word] = []
+        var segStart: Double = 0
+
+        for word in allWords {
+            if currentWords.isEmpty {
+                segStart = word.start
+            }
+            currentWords.append(word)
+
+            let endsWithPunctuation = word.text.hasSuffix(".") || word.text.hasSuffix("?") || word.text.hasSuffix("!")
+            if endsWithPunctuation || currentWords.count >= 30 {
+                let text = currentWords.map { $0.text }.joined(separator: " ")
+                let segEnd = currentWords.last!.end
+
+                let speaker: String? = diarization.flatMap { diar in
+                    findSpeaker(at: segStart, in: diar)
+                }
+
+                segments.append(Segment(
+                    start: segStart,
+                    end: segEnd,
+                    text: cleanText(text),
+                    speaker: speaker,
+                    words: currentWords
+                ))
+                currentWords = []
+            }
+        }
+
+        // Flush remaining
+        if !currentWords.isEmpty {
+            let text = currentWords.map { $0.text }.joined(separator: " ")
+            let segEnd = currentWords.last!.end
+            let speaker: String? = diarization.flatMap { diar in
+                findSpeaker(at: segStart, in: diar)
+            }
+            segments.append(Segment(
+                start: segStart,
+                end: segEnd,
+                text: cleanText(text),
+                speaker: speaker,
+                words: currentWords
+            ))
+        }
+
+        return segments
     }
 
     // MARK: - Plain Text
 
-    private static func formatText(results: [TranscriptionResult], speakerSegments: [[SpeakerSegment]]?) -> String {
-        if let speakerSegments = speakerSegments {
-            return formatTextWithSpeakers(speakerSegments: speakerSegments)
-        }
-        return formatTextPlain(results: results)
-    }
-
-    private static func formatTextPlain(results: [TranscriptionResult]) -> String {
+    private static func formatText(segments: [Segment]) -> String {
         var lines: [String] = []
-        for result in results {
-            for segment in result.segments {
-                let timestamp = formatTimestamp(segment.start)
-                lines.append("[\(timestamp)] \(cleanText(segment.text))")
+        for seg in segments {
+            let ts = formatTimestamp(seg.start)
+            if let speaker = seg.speaker {
+                lines.append("[\(ts)] \(speakerLabel(speaker)): \(seg.text)")
+            } else {
+                lines.append("[\(ts)] \(seg.text)")
             }
         }
-        return lines.joined(separator: "\n")
-    }
-
-    private static func formatTextWithSpeakers(speakerSegments: [[SpeakerSegment]]) -> String {
-        var lines: [String] = []
-        for group in speakerSegments {
-            for segment in group {
-                let timestamp = formatTimestamp(segment.startTime)
-                let speaker = speakerLabel(segment.speaker)
-                let text = cleanText(segment.transcription?.text ?? "") ?? ""
-                if !text.isEmpty {
-                    lines.append("[\(timestamp)] \(speaker): \(text)")
-                }
-            }
-        }
-        return lines.joined(separator: "\n")
+        return lines.joined(separator: "\n") + "\n"
     }
 
     // MARK: - JSON
 
-    private static func formatJSON(results: [TranscriptionResult], speakerSegments: [[SpeakerSegment]]?, hasDiarization: Bool) -> String {
-        var segments: [[String: Any]] = []
+    private static func formatJSON(segments: [Segment], duration: Double, hasDiarization: Bool) -> String {
+        var jsonSegments: [[String: Any]] = []
 
-        if let speakerSegments = speakerSegments {
-            for group in speakerSegments {
-                for segment in group {
-                    var dict: [String: Any] = [
-                        "start": segment.startTime,
-                        "end": segment.endTime,
-                        "speaker": speakerLabel(segment.speaker),
-                    ]
-                    if let transcription = segment.transcription {
-                        dict["text"] = transcription.text.trimmingCharacters(in: .whitespaces)
-                    }
-                    if !segment.speakerWords.isEmpty {
-                        dict["words"] = segment.speakerWords.map { word in
-                            var w: [String: Any] = [
-                                "start": word.wordTiming.start,
-                                "end": word.wordTiming.end,
-                                "text": word.wordTiming.word,
-                            ]
-                            w["speaker"] = speakerLabel(word.speaker)
-                            return w
-                        }
-                    }
-                    segments.append(dict)
+        for seg in segments {
+            var dict: [String: Any] = [
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text,
+            ]
+            if let speaker = seg.speaker {
+                dict["speaker"] = speakerLabel(speaker)
+            }
+            if !seg.words.isEmpty {
+                dict["words"] = seg.words.map { w in
+                    [
+                        "start": w.start,
+                        "end": w.end,
+                        "text": w.text,
+                    ] as [String: Any]
                 }
             }
-        } else {
-            for result in results {
-                for segment in result.segments {
-                    var dict: [String: Any] = [
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": cleanText(segment.text),
-                    ]
-                    if let words = segment.words, !words.isEmpty {
-                        dict["words"] = words.map { word in
-                            [
-                                "start": word.start,
-                                "end": word.end,
-                                "text": word.word,
-                            ] as [String: Any]
-                        }
-                    }
-                    segments.append(dict)
-                }
-            }
+            jsonSegments.append(dict)
         }
-
-        let totalDuration = results.last?.segments.last?.end ?? 0
 
         let output: [String: Any] = [
             "metadata": [
-                "duration": totalDuration,
+                "duration": duration,
                 "diarization": hasDiarization,
             ],
-            "segments": segments,
+            "segments": jsonSegments,
         ]
 
         guard let data = try? JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]),
@@ -132,104 +197,64 @@ enum OutputFormatter {
             return "{\"error\": \"Failed to serialize JSON\"}"
         }
 
-        return string
+        return string + "\n"
     }
 
     // MARK: - SRT
 
-    private static func formatSRT(results: [TranscriptionResult], speakerSegments: [[SpeakerSegment]]?) -> String {
+    private static func formatSRT(segments: [Segment]) -> String {
         var lines: [String] = []
-        var index = 1
-
-        if let speakerSegments = speakerSegments {
-            for group in speakerSegments {
-                for segment in group {
-                    let text = cleanText(segment.transcription?.text ?? "") ?? ""
-                    guard !text.isEmpty else { continue }
-                    let start = formatSRTTimestamp(segment.startTime)
-                    let end = formatSRTTimestamp(segment.endTime)
-                    let speaker = speakerLabel(segment.speaker)
-                    lines.append("\(index)")
-                    lines.append("\(start) --> \(end)")
-                    lines.append("[\(speaker)] \(text)")
-                    lines.append("")
-                    index += 1
-                }
-            }
-        } else {
-            for result in results {
-                for segment in result.segments {
-                    let start = formatSRTTimestamp(segment.start)
-                    let end = formatSRTTimestamp(segment.end)
-                    let text = cleanText(segment.text)
-                    lines.append("\(index)")
-                    lines.append("\(start) --> \(end)")
-                    lines.append(text)
-                    lines.append("")
-                    index += 1
-                }
-            }
+        for (i, seg) in segments.enumerated() {
+            let start = formatSRTTimestamp(seg.start)
+            let end = formatSRTTimestamp(seg.end)
+            let prefix = seg.speaker.map { "[\(speakerLabel($0))] " } ?? ""
+            lines.append("\(i + 1)")
+            lines.append("\(start) --> \(end)")
+            lines.append("\(prefix)\(seg.text)")
+            lines.append("")
         }
-
         return lines.joined(separator: "\n")
     }
 
     // MARK: - VTT
 
-    private static func formatVTT(results: [TranscriptionResult], speakerSegments: [[SpeakerSegment]]?) -> String {
+    private static func formatVTT(segments: [Segment]) -> String {
         var lines: [String] = ["WEBVTT", ""]
-
-        if let speakerSegments = speakerSegments {
-            for group in speakerSegments {
-                for segment in group {
-                    let text = cleanText(segment.transcription?.text ?? "") ?? ""
-                    guard !text.isEmpty else { continue }
-                    let start = formatVTTTimestamp(segment.startTime)
-                    let end = formatVTTTimestamp(segment.endTime)
-                    let speaker = speakerLabel(segment.speaker)
-                    lines.append("\(start) --> \(end)")
-                    lines.append("<v \(speaker)>\(text)")
-                    lines.append("")
-                }
+        for seg in segments {
+            let start = formatVTTTimestamp(seg.start)
+            let end = formatVTTTimestamp(seg.end)
+            lines.append("\(start) --> \(end)")
+            if let speaker = seg.speaker {
+                lines.append("<v \(speakerLabel(speaker))>\(seg.text)")
+            } else {
+                lines.append(seg.text)
             }
-        } else {
-            for result in results {
-                for segment in result.segments {
-                    let start = formatVTTTimestamp(segment.start)
-                    let end = formatVTTTimestamp(segment.end)
-                    let text = cleanText(segment.text)
-                    lines.append("\(start) --> \(end)")
-                    lines.append(text)
-                    lines.append("")
-                }
-            }
+            lines.append("")
         }
-
         return lines.joined(separator: "\n")
     }
 
     // MARK: - Helpers
 
-    /// Strip Whisper special tokens from text (e.g., <|startoftranscript|>, <|en|>, <|0.00|>)
     private static func cleanText(_ text: String) -> String {
-        // Remove all <|...|> tokens
         let pattern = "<\\|[^|]*\\|>"
         let cleaned = text.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
         return cleaned.trimmingCharacters(in: .whitespaces)
     }
 
-    private static func speakerLabel(_ info: SpeakerInfo) -> String {
-        switch info {
-        case .speakerId(let id):
-            return "Speaker \(id + 1)"
-        case .multiple(let ids):
-            return ids.map { "Speaker \($0 + 1)" }.joined(separator: "/")
-        case .noMatch:
-            return "Unknown"
+    private static func speakerLabel(_ id: String) -> String {
+        // FluidAudio returns IDs like "0", "1", "2" — map to "Speaker 1", etc.
+        if let num = Int(id) {
+            return "Speaker \(num + 1)"
         }
+        return id
     }
 
-    private static func formatTimestamp(_ seconds: Float) -> String {
+    private static func findSpeaker(at time: Double, in diarization: [DiarizationSegment]) -> String? {
+        return diarization.first(where: { time >= $0.start && time < $0.end })?.speaker
+    }
+
+    private static func formatTimestamp(_ seconds: Double) -> String {
         let totalSeconds = Int(seconds)
         let hours = totalSeconds / 3600
         let minutes = (totalSeconds % 3600) / 60
@@ -240,21 +265,21 @@ enum OutputFormatter {
         return String(format: "%02d:%02d", minutes, secs)
     }
 
-    private static func formatSRTTimestamp(_ seconds: Float) -> String {
+    private static func formatSRTTimestamp(_ seconds: Double) -> String {
         let totalSeconds = Int(seconds)
         let hours = totalSeconds / 3600
         let minutes = (totalSeconds % 3600) / 60
         let secs = totalSeconds % 60
-        let millis = Int((seconds - Float(totalSeconds)) * 1000)
+        let millis = Int((seconds - Double(totalSeconds)) * 1000)
         return String(format: "%02d:%02d:%02d,%03d", hours, minutes, secs, millis)
     }
 
-    private static func formatVTTTimestamp(_ seconds: Float) -> String {
+    private static func formatVTTTimestamp(_ seconds: Double) -> String {
         let totalSeconds = Int(seconds)
         let hours = totalSeconds / 3600
         let minutes = (totalSeconds % 3600) / 60
         let secs = totalSeconds % 60
-        let millis = Int((seconds - Float(totalSeconds)) * 1000)
+        let millis = Int((seconds - Double(totalSeconds)) * 1000)
         return String(format: "%02d:%02d:%02d.%03d", hours, minutes, secs, millis)
     }
 }

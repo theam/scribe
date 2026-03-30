@@ -1,7 +1,6 @@
 import ArgumentParser
+import FluidAudio
 import Foundation
-import SpeakerKit
-import WhisperKit
 
 struct Transcribe: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -20,9 +19,6 @@ struct Transcribe: AsyncParsableCommand {
     @Option(name: .long, help: "Output format: txt, json, srt, vtt.")
     var format: OutputFormat = .txt
 
-    @Option(name: .long, help: "Whisper model to use (e.g., large-v3-turbo, large-v3, small, tiny).")
-    var model: String = "large-v3-turbo"
-
     @Option(name: .long, help: "Language code (auto-detect if not specified).")
     var language: String?
 
@@ -38,73 +34,74 @@ struct Transcribe: AsyncParsableCommand {
             throw ValidationError("File not found: \(audioFile)")
         }
 
-        if verbose {
-            log("Loading model '\(model)'...")
-        }
+        // Load audio
+        if verbose { log("Loading audio...") }
+        let converter = AudioConverter()
+        let samples = try converter.resampleAudioFile(fileURL)
+        let duration = Double(samples.count) / 16000.0
 
-        // Initialize WhisperKit — map friendly names to HuggingFace folder names
-        let resolvedModel = Self.resolveModelName(model)
-        let config = WhisperKitConfig(
-            model: resolvedModel,
-            verbose: verbose,
-            logLevel: verbose ? .debug : .error
-        )
-        let whisperKit = try await WhisperKit(config)
+        if verbose { log(String(format: "Audio loaded: %.0fs (%.1f min)", duration, duration / 60)) }
 
-        if verbose {
-            log("Transcribing '\(audioFile)'...")
-        }
+        // Transcribe with Parakeet TDT v3
+        if verbose { log("Loading ASR model (Parakeet TDT v3)...") }
+        let asrModels = try await AsrModels.downloadAndLoad(version: .v3)
+        let asrManager = AsrManager()
+        try await asrManager.initialize(models: asrModels)
 
-        // Transcribe
+        if verbose { log("Transcribing '\(audioFile)'...") }
         let startTime = Date()
-        var options = DecodingOptions()
-        if let lang = language {
-            options.language = lang
-        }
-        options.wordTimestamps = true
-
-        let results = try await whisperKit.transcribe(audioPath: fileURL.path, decodeOptions: options)
+        let asrResult = try await asrManager.transcribe(samples, source: .system)
         let transcribeElapsed = Date().timeIntervalSince(startTime)
 
         if verbose {
-            log(String(format: "Transcription completed in %.1fs", transcribeElapsed))
+            log(String(format: "Transcription completed in %.1fs (%.1fx real-time)",
+                       transcribeElapsed, duration / transcribeElapsed))
         }
 
         // Diarize if requested
-        var diarizationResult: DiarizationResult? = nil
+        var diarizationSegments: [DiarizationSegment]? = nil
         if diarize {
-            if verbose {
-                log("Diarizing speakers...")
-            }
+            if verbose { log("Loading diarization model...") }
             let diarizeStart = Date()
-            diarizationResult = try await Diarizer.diarize(
-                audioPath: fileURL.path,
-                numSpeakers: speakers,
-                verbose: verbose
-            )
+
+            let offlineConfig = OfflineDiarizerConfig()
+            let offlineManager = OfflineDiarizerManager(config: offlineConfig)
+            try await offlineManager.prepareModels()
+
+            if verbose { log("Diarizing speakers...") }
+            let diarResult = try await offlineManager.process(audio: samples)
+
+            let speakerCount = Set(diarResult.segments.map { $0.speakerId }).count
             let diarizeElapsed = Date().timeIntervalSince(diarizeStart)
+
+            diarizationSegments = diarResult.segments.map { seg in
+                DiarizationSegment(
+                    speaker: seg.speakerId,
+                    start: Double(seg.startTimeSeconds),
+                    end: Double(seg.endTimeSeconds)
+                )
+            }
+
             if verbose {
                 log(String(format: "Diarization completed in %.1fs (%d speakers detected)",
-                           diarizeElapsed, diarizationResult?.speakerCount ?? 0))
+                           diarizeElapsed, speakerCount))
             }
         }
 
         // Format output
         let formatted = OutputFormatter.format(
-            results: results,
-            diarization: diarizationResult,
+            asrResult: asrResult,
+            diarization: diarizationSegments,
+            duration: duration,
             format: format
         )
 
         // Write output
         if let outputPath = output {
             try formatted.write(toFile: outputPath, atomically: true, encoding: String.Encoding.utf8)
-            if verbose {
-                log("Written to \(outputPath)")
-            }
+            if verbose { log("Written to \(outputPath)") }
         } else {
             print(formatted, terminator: "")
-            // Ensure stdout is flushed before writing to stderr
             fflush(stdout)
         }
 
@@ -112,23 +109,10 @@ struct Transcribe: AsyncParsableCommand {
             let totalElapsed = Date().timeIntervalSince(startTime)
             log(String(format: "Total time: %.1fs", totalElapsed))
         }
+
+        await asrManager.cleanup()
     }
 
-    /// Map friendly model names to HuggingFace folder names.
-    private static func resolveModelName(_ name: String) -> String {
-        let mapping: [String: String] = [
-            "large-v3-turbo": "openai_whisper-large-v3-v20240930_turbo_632MB",
-            "large-v3": "openai_whisper-large-v3_947MB",
-            "medium": "openai_whisper-medium",
-            "small": "openai_whisper-small",
-            "base": "openai_whisper-base",
-            "tiny": "openai_whisper-tiny",
-            "distil-large-v3": "distil-whisper_distil-large-v3",
-        ]
-        return mapping[name] ?? name
-    }
-
-    /// Write to stderr so it doesn't mix with stdout output.
     private func log(_ message: String) {
         FileHandle.standardError.write(Data("[scribe] \(message)\n".utf8))
     }
@@ -136,6 +120,14 @@ struct Transcribe: AsyncParsableCommand {
 
 // MARK: - Output Format
 
-enum OutputFormat: String, ExpressibleByArgument, CaseIterable {
+enum OutputFormat: String, ExpressibleByArgument, CaseIterable, Sendable {
     case txt, json, srt, vtt
+}
+
+// MARK: - Diarization Segment (internal)
+
+struct DiarizationSegment: Sendable {
+    let speaker: String
+    let start: Double
+    let end: Double
 }
