@@ -64,7 +64,15 @@ struct Transcribe: AsyncParsableCommand {
             if verbose { log("Loading diarization model...") }
             let diarizeStart = Date()
 
-            let offlineConfig = OfflineDiarizerConfig()
+            // High-quality config: stepRatio=0.1, minSegmentDuration=0, lower clustering threshold
+            var offlineConfig = OfflineDiarizerConfig(
+                clusteringThreshold: 0.7,
+                segmentationStepRatio: 0.1,
+                minSegmentDuration: 0.0
+            )
+            if let n = speakers {
+                offlineConfig.clustering.numSpeakers = n
+            }
             let offlineManager = OfflineDiarizerManager(config: offlineConfig)
             try await offlineManager.prepareModels()
 
