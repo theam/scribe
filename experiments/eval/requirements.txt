@@ -1,0 +1,2 @@
+jiwer>=3.0,<5.0
+huggingface-hub>=0.20

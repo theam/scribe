@@ -1,0 +1,6 @@
+# Downloaded datasets (large audio files)
+datasets/
+
+# Python
+__pycache__/
+*.pyc

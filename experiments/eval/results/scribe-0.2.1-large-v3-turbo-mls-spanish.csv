@@ -1,0 +1,4 @@
+file_id,dataset,label,model,duration_secs,speakers,scribe_version,processing_secs,rtf,wer,mer,wil,substitutions,deletions,insertions,ref_words,hyp_words,error
+chapter_11991,mls-spanish,MLS Spanish chapter_11991,large-v3-turbo,4019.9,1,0.2.1,49.9,0.0124,0.1489,0.1473,0.2229,786,520,100,9443,9023,
+chapter_1378,mls-spanish,MLS Spanish chapter_1378,large-v3-turbo,5640.8,1,0.2.1,70.6,0.0125,0.0499,0.0495,0.0799,461,145,121,14580,14556,
+chapter_567,mls-spanish,MLS Spanish chapter_567,large-v3-turbo,5262.6,1,0.2.1,66.1,0.0126,0.0787,0.0777,0.1228,646,230,186,13489,13445,

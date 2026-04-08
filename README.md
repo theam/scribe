@@ -114,6 +114,27 @@ scribe models download all    # download ASR + diarization models for offline us
 }
 ```
 
+## Accuracy
+
+Measured on standard evaluation datasets using [jiwer](https://github.com/jitsi/jiwer) (Word Error Rate — lower is better). Results are deterministic and reproducible.
+
+| Dataset | Description | WER | Speed |
+|---------|-------------|-----|-------|
+| [TED-LIUM 3](https://huggingface.co/datasets/distil-whisper/tedlium-long-form) | TED talks — clean English, single speaker | **6.0%** | 138x real-time |
+| [MLS Spanish](https://huggingface.co/datasets/facebook/multilingual_librispeech) | Audiobooks — clean Spanish, single speaker | **8.5%** | 80x real-time |
+| [Earnings-21](https://huggingface.co/datasets/Revai/earnings21) | Earnings calls — noisy English, 5-10 speakers | **12.9%** | 135x real-time |
+
+These numbers are competitive with commercial cloud transcription services:
+
+| Service | Typical WER | Price | Local? |
+|---------|------------|-------|--------|
+| **scribe** | **6–13%** | **Free** | **Yes** |
+| AssemblyAI | 5.6% (avg) | $0.15–0.45/hr | No |
+| Deepgram Nova-3 | 5.3% (batch) | $0.39–0.46/hr | No |
+| Otter.ai | 12–19% | ~$1/hr | No |
+
+> Eval methodology, datasets, and raw CSV results: [`experiments/eval/`](https://github.com/theam/scribe/tree/main/experiments/eval)
+
 ## Performance
 
 Tested on Apple Silicon (M-series):
