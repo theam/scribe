@@ -235,24 +235,28 @@ def load_dipco(session_ids: list[str]) -> list[dict]:
 # ========== Core eval functions ==========
 
 def run_scribe(wav_path: Path, model: str = "large-v3-turbo",
-               scribe_bin: str = "scribe") -> tuple[str, float]:
-    """Run scribe transcribe on an audio file. Returns (transcript, elapsed_secs)."""
-    # Build command — v0.2+ doesn't have --model flag (uses Parakeet by default)
+               scribe_bin: str = "scribe", mode: str = "batch") -> tuple[str, float]:
+    """Run scribe on an audio file. Returns (transcript, elapsed_secs).
+
+    mode="batch":     calls `scribe transcribe ...` (offline, full audio at once)
+    mode="streaming": calls `scribe stream --audio-file ...` (chunked through streaming engine)
+    """
+    if mode == "streaming":
+        return _run_scribe_streaming(wav_path, scribe_bin)
+    return _run_scribe_batch(wav_path, model, scribe_bin)
+
+
+def _run_scribe_batch(wav_path: Path, model: str, scribe_bin: str) -> tuple[str, float]:
     cmd = [scribe_bin, "transcribe", str(wav_path), "--format", "txt"]
 
-    # Check if scribe supports --model flag (v0.1.x only)
+    # Check if scribe supports --model flag (v0.1.x only — v0.2+ uses Parakeet by default)
     version_result = subprocess.run([scribe_bin, "--version"], capture_output=True, text=True)
     version = version_result.stdout.strip()
     if version.startswith("0.1"):
         cmd.extend(["--model", model])
 
     start = time.monotonic()
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     elapsed = time.monotonic() - start
 
     if result.returncode != 0:
@@ -263,13 +267,48 @@ def run_scribe(wav_path: Path, model: str = "large-v3-turbo",
     text_parts = []
     for line in lines:
         cleaned = re.sub(r"^\[[\d:]+\]\s*(?:(?:Speaker\s+\d+|Unknown):\s*)?", "", line)
-        cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)  # Remove italic markers
+        cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)
         cleaned = cleaned.strip()
         if cleaned and cleaned != "-":
             text_parts.append(cleaned)
 
-    transcript = " ".join(text_parts)
-    return transcript, elapsed
+    return " ".join(text_parts), elapsed
+
+
+def _run_scribe_streaming(wav_path: Path, scribe_bin: str) -> tuple[str, float]:
+    """Feed an audio file through `scribe stream --audio-file` and parse JSONL output.
+
+    Each JSONL line is `{"text": "...", "time": 1.2}` representing a confirmed delta.
+    Concatenate the `text` fields in order to build the full hypothesis.
+    """
+    cmd = [
+        scribe_bin, "stream",
+        "--audio-file", str(wav_path),
+        "--engine", "nemotron",
+        "--format", "jsonl",
+    ]
+
+    start = time.monotonic()
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    elapsed = time.monotonic() - start
+
+    if result.returncode != 0:
+        raise RuntimeError(f"scribe stream failed on {wav_path}: {result.stderr}")
+
+    text_parts = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = obj.get("text", "").strip()
+        if text:
+            text_parts.append(text)
+
+    return " ".join(text_parts), elapsed
 
 
 def compute_wer(reference: str, hypothesis: str) -> dict:
@@ -298,7 +337,7 @@ def get_scribe_version(scribe_bin: str = "scribe") -> str:
 
 
 def run_eval(entries: list[dict], model: str, scribe_version: str,
-             scribe_bin: str = "scribe") -> list[dict]:
+             scribe_bin: str = "scribe", mode: str = "batch") -> list[dict]:
     """Run evaluation on all entries."""
     results = []
 
@@ -308,17 +347,21 @@ def run_eval(entries: list[dict], model: str, scribe_version: str,
         dur_min = entry["duration_secs"] / 60
 
         print(f"\n--- {fid}: {label} ({dur_min:.1f}m, {entry['speakers']} speakers) ---")
-        print(f"  Transcribing with {model}...")
+        if mode == "streaming":
+            print(f"  Streaming via scribe stream --audio-file (engine: nemotron)...")
+        else:
+            print(f"  Transcribing with {model}...")
 
         try:
-            hypothesis, elapsed = run_scribe(entry["wav_path"], model=model, scribe_bin=scribe_bin)
+            hypothesis, elapsed = run_scribe(entry["wav_path"], model=model, scribe_bin=scribe_bin, mode=mode)
         except Exception as e:
             print(f"  ERROR: {e}")
             results.append({
                 "file_id": fid,
                 "dataset": entry["dataset"],
                 "label": label,
-                "model": model,
+                "model": "nemotron-streaming" if mode == "streaming" else model,
+                "mode": mode,
                 "duration_secs": round(entry["duration_secs"], 1),
                 "speakers": entry["speakers"],
                 "scribe_version": scribe_version,
@@ -361,7 +404,8 @@ def run_eval(entries: list[dict], model: str, scribe_version: str,
             "file_id": fid,
             "dataset": entry["dataset"],
             "label": label,
-            "model": model,
+            "model": "nemotron-streaming" if mode == "streaming" else model,
+            "mode": mode,
             "duration_secs": round(entry["duration_secs"], 1),
             "speakers": entry["speakers"],
             "scribe_version": scribe_version,
@@ -391,7 +435,7 @@ def write_csv(results: list[dict], output_path: Path):
         return
 
     fieldnames = [
-        "file_id", "dataset", "label", "model",
+        "file_id", "dataset", "label", "model", "mode",
         "duration_secs", "speakers", "scribe_version",
         "processing_secs", "rtf",
         "wer", "mer", "wil",
@@ -460,10 +504,13 @@ def main():
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--output", type=str, help="Output CSV path")
     parser.add_argument("--scribe-bin", default="scribe", help="Path to scribe binary")
+    parser.add_argument("--mode", choices=["batch", "streaming"], default="batch",
+                        help="Eval mode: 'batch' (scribe transcribe) or 'streaming' (scribe stream --audio-file)")
     args = parser.parse_args()
 
     scribe_version = get_scribe_version(args.scribe_bin)
     print(f"scribe version: {scribe_version} ({args.scribe_bin})")
+    print(f"Mode: {args.mode}")
     print(f"Model: {args.model}")
     print(f"Dataset: {args.dataset}")
 
@@ -481,8 +528,11 @@ def main():
         entries.extend(load_tedlium(file_ids))
 
     if args.dataset in ("mls-spanish", "all"):
-        print("\n--- Loading MLS Spanish ---")
-        entries.extend(load_mls_spanish(args.max_files))
+        if args.mode == "streaming":
+            print("\n--- Skipping MLS Spanish (Nemotron streaming engine is English-only) ---")
+        else:
+            print("\n--- Loading MLS Spanish ---")
+            entries.extend(load_mls_spanish(args.max_files))
 
     if args.dataset == "dipco":
         print("\n--- Loading DiPCo ---")
@@ -499,12 +549,15 @@ def main():
 
     # Run eval
     print(f"\n--- Running evaluation ({len(entries)} files) ---")
-    results = run_eval(entries, args.model, scribe_version, scribe_bin=args.scribe_bin)
+    results = run_eval(entries, args.model, scribe_version, scribe_bin=args.scribe_bin, mode=args.mode)
 
     # Write results
-    output_path = Path(args.output) if args.output else (
-        RESULTS_DIR / f"scribe-{scribe_version}-{args.model}-{args.dataset}.csv"
-    )
+    if args.output:
+        output_path = Path(args.output)
+    elif args.mode == "streaming":
+        output_path = RESULTS_DIR / f"scribe-{scribe_version}-streaming-{args.dataset}.csv"
+    else:
+        output_path = RESULTS_DIR / f"scribe-{scribe_version}-{args.model}-{args.dataset}.csv"
     write_csv(results, output_path)
     print_summary(results)
 

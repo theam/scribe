@@ -55,6 +55,9 @@ struct Stream: AsyncParsableCommand {
     @Flag(name: .long, help: "Show status information.")
     var verbose: Bool = false
 
+    @Option(name: .long, help: "Read audio from a WAV/audio file instead of microphone (for testing/eval). Exits when file is consumed.")
+    var audioFile: String?
+
     func run() async throws {
         switch engine {
         case .nemotron:
@@ -94,6 +97,20 @@ struct Stream: AsyncParsableCommand {
     }
 
     private func runNemotronWithEngine(_ engine: any StreamingAsrEngine) async throws {
+        let startTime = Date()
+        let outputFile = openOutputFile()
+
+        // Wire up the partial-transcript callback (delta emission to stdout/stderr/file).
+        await setupNemotronCallback(engine: engine, startTime: startTime, outputFile: outputFile)
+
+        if let path = audioFile {
+            try await runNemotronFromFile(engine: engine, path: path)
+        } else {
+            try await runNemotronFromMic(engine: engine)
+        }
+    }
+
+    private func runNemotronFromMic(engine: any StreamingAsrEngine) async throws {
         let audioEngine = AVAudioEngine()
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -102,15 +119,84 @@ struct Stream: AsyncParsableCommand {
             log("Microphone: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) ch")
         }
 
-        let startTime = Date()
+        setupSignalHandler()
+
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
+            nonisolated(unsafe) let buf = buffer
+            do { try engine.appendAudio(buf) } catch {}
+        }
+
+        try audioEngine.start()
+        log("Listening (English, low latency)... press Ctrl+C to stop")
+
+        // Processing loop — drives the engine to process buffered audio
+        while true {
+            try await engine.processBufferedAudio()
+            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        }
+    }
+
+    /// Feed a pre-recorded audio file into the streaming engine.
+    /// Reads the whole file via FluidAudio's AudioConverter (16kHz mono Float32),
+    /// chunks it to mimic the live mic tap, and exits cleanly when done.
+    private func runNemotronFromFile(engine: any StreamingAsrEngine, path: String) async throws {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw ValidationError("Audio file not found: \(path)")
+        }
+
+        if verbose { log("Loading audio file: \(path)") }
+        let converter = AudioConverter()
+        let samples = try converter.resampleAudioFile(url)
+        let duration = Double(samples.count) / 16000.0
+        if verbose {
+            log(String(format: "Loaded %.0fs (%.1f min), %d samples", duration, duration / 60, samples.count))
+        }
+        log("Streaming from file (no microphone)...")
+
+        // Build a 16kHz mono Float32 format to match what the engine expects.
+        guard let audioFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16000,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw ValidationError("Failed to create audio format")
+        }
+
+        // Match the mic tap chunk size for parity with live behavior.
+        let chunkSize = 4096
+        var offset = 0
+        while offset < samples.count {
+            let end = min(offset + chunkSize, samples.count)
+            let frameCount = AVAudioFrameCount(end - offset)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount) else {
+                throw ValidationError("Failed to allocate audio buffer")
+            }
+            buffer.frameLength = frameCount
+            if let channelData = buffer.floatChannelData {
+                samples.withUnsafeBufferPointer { src in
+                    memcpy(channelData[0], src.baseAddress!.advanced(by: offset), Int(frameCount) * MemoryLayout<Float>.stride)
+                }
+            }
+            nonisolated(unsafe) let buf = buffer
+            try await engine.appendAudio(buf)
+            try await engine.processBufferedAudio()
+            offset = end
+        }
+
+        // Critical: flush any remaining buffered audio so the tail of the transcript isn't dropped.
+        let finalText = try await engine.finish()
+        if verbose { log("Finalized. Total transcript length: \(finalText.count) chars") }
+
+        // Reset terminal line in case the live preview left an unfinished line on stderr.
+        FileHandle.standardError.write(Data("\n".utf8))
+    }
+
+    /// Set up the partial-transcript callback used by both mic and file modes.
+    private func setupNemotronCallback(engine: any StreamingAsrEngine, startTime: Date, outputFile: FileHandle?) async {
         let state = StreamState()
         let fmt = format
-        var outputFile: FileHandle? = nil
-
-        if let outputPath = output {
-            FileManager.default.createFile(atPath: outputPath, contents: nil)
-            outputFile = FileHandle(forWritingAtPath: outputPath)
-        }
 
         // Capture file handle for sendable closure
         nonisolated(unsafe) let outFile = outputFile
@@ -164,27 +250,21 @@ struct Stream: AsyncParsableCommand {
                 }
             }
         }
+    }
 
-        setupSignalHandler()
-
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
-            nonisolated(unsafe) let buf = buffer
-            do { try engine.appendAudio(buf) } catch {}
-        }
-
-        try audioEngine.start()
-        log("Listening (English, low latency)... press Ctrl+C to stop")
-
-        // Processing loop — drives the engine to process buffered audio
-        while true {
-            try await engine.processBufferedAudio()
-            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
-        }
+    private func openOutputFile() -> FileHandle? {
+        guard let outputPath = output else { return nil }
+        FileManager.default.createFile(atPath: outputPath, contents: nil)
+        return FileHandle(forWritingAtPath: outputPath)
     }
 
     // MARK: - SlidingWindow Engine (Multilingual, default)
 
     private func runSlidingWindow() async throws {
+        if audioFile != nil {
+            throw ValidationError("--audio-file is not yet supported with the multilingual engine. Use --engine nemotron for now.")
+        }
+
         log("Initializing streaming ASR (Parakeet TDT v3, multilingual)...")
         log("Downloading model if needed (first run only, ~600MB)...")
 
