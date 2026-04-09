@@ -70,10 +70,10 @@ struct Stream: AsyncParsableCommand {
     // MARK: - Nemotron Engine (English-only, low latency)
 
     private func runNemotron() async throws {
-        log("Initializing streaming ASR (Nemotron 560ms, English-only)...")
+        log("Initializing streaming ASR (Nemotron 1120ms, English-only)...")
         log("Downloading model if needed (first run only, ~600MB)...")
 
-        let engine = StreamingAsrEngineFactory.create(.nemotron560ms)
+        let engine = StreamingAsrEngineFactory.create(.nemotron1120ms)
 
         do {
             try await engine.loadModels()
@@ -85,7 +85,7 @@ struct Stream: AsyncParsableCommand {
                 .appendingPathComponent("FluidAudio/Models/nemotron-streaming")
             try? FileManager.default.removeItem(at: cacheDir)
 
-            let freshEngine = StreamingAsrEngineFactory.create(.nemotron560ms)
+            let freshEngine = StreamingAsrEngineFactory.create(.nemotron1120ms)
             try await freshEngine.loadModels()
             log("Retry successful.")
             try await runNemotronWithEngine(freshEngine)
@@ -100,12 +100,15 @@ struct Stream: AsyncParsableCommand {
         let startTime = Date()
         let outputFile = openOutputFile()
 
-        // Wire up the partial-transcript callback (delta emission to stdout/stderr/file).
-        await setupNemotronCallback(engine: engine, startTime: startTime, outputFile: outputFile)
-
         if let path = audioFile {
-            try await runNemotronFromFile(engine: engine, path: path)
+            // File mode: do NOT set up the per-chunk callback. Use finish() as the
+            // authoritative transcript source. The callback path drops content because
+            // (a) finish() may decode tokens after the last chunk callback, and
+            // (b) Task { } dispatched from the callback may not run before exit.
+            try await runNemotronFromFile(engine: engine, path: path, startTime: startTime, outputFile: outputFile)
         } else {
+            // Mic mode: live preview via per-chunk callback (acceptable streaming UX).
+            await setupNemotronCallback(engine: engine, startTime: startTime, outputFile: outputFile)
             try await runNemotronFromMic(engine: engine)
         }
     }
@@ -138,8 +141,9 @@ struct Stream: AsyncParsableCommand {
 
     /// Feed a pre-recorded audio file into the streaming engine.
     /// Reads the whole file via FluidAudio's AudioConverter (16kHz mono Float32),
-    /// chunks it to mimic the live mic tap, and exits cleanly when done.
-    private func runNemotronFromFile(engine: any StreamingAsrEngine, path: String) async throws {
+    /// chunks it to mimic the live mic tap, calls finish() for the authoritative
+    /// transcript, and emits it once. No per-chunk callback (see runNemotronWithEngine).
+    private func runNemotronFromFile(engine: any StreamingAsrEngine, path: String, startTime: Date, outputFile: FileHandle?) async throws {
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ValidationError("Audio file not found: \(path)")
@@ -154,7 +158,10 @@ struct Stream: AsyncParsableCommand {
         }
         log("Streaming from file (no microphone)...")
 
-        // Build a 16kHz mono Float32 format to match what the engine expects.
+        // Match the official FluidAudio reference pattern (NemotronTranscribe.swift):
+        // load the WHOLE file into a single AVAudioPCMBuffer and feed it as one
+        // appendAudio call. The engine handles internal chunking. This avoids any
+        // boundary issues from feeding the engine many tiny buffers in a loop.
         guard let audioFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: 16000,
@@ -164,33 +171,58 @@ struct Stream: AsyncParsableCommand {
             throw ValidationError("Failed to create audio format")
         }
 
-        // Match the mic tap chunk size for parity with live behavior.
-        let chunkSize = 4096
-        var offset = 0
-        while offset < samples.count {
-            let end = min(offset + chunkSize, samples.count)
-            let frameCount = AVAudioFrameCount(end - offset)
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount) else {
-                throw ValidationError("Failed to allocate audio buffer")
+        let frameCount = AVAudioFrameCount(samples.count)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount) else {
+            throw ValidationError("Failed to allocate audio buffer")
+        }
+        buffer.frameLength = frameCount
+        if let channelData = buffer.floatChannelData {
+            samples.withUnsafeBufferPointer { src in
+                memcpy(channelData[0], src.baseAddress!, samples.count * MemoryLayout<Float>.stride)
             }
-            buffer.frameLength = frameCount
-            if let channelData = buffer.floatChannelData {
-                samples.withUnsafeBufferPointer { src in
-                    memcpy(channelData[0], src.baseAddress!.advanced(by: offset), Int(frameCount) * MemoryLayout<Float>.stride)
-                }
+        }
+        nonisolated(unsafe) let buf = buffer
+        try await engine.appendAudio(buf)
+        try await engine.processBufferedAudio()
+
+        // Authoritative final transcript: finish() pads any trailing partial chunk,
+        // returns the full decoded text, and clears internal state. We use this as
+        // the source of truth (not the per-chunk callback, which drops content).
+        let finalText = try await engine.finish()
+        if verbose { log(String(format: "Finalized. Final transcript: %d chars", finalText.count)) }
+
+        // Emit the complete transcript as a single result.
+        emitFinalTranscript(finalText, startTime: startTime, outputFile: outputFile)
+    }
+
+    /// Emit the final (authoritative) transcript from finish() as one record.
+    /// In file mode this is the only output that goes to stdout — no per-chunk deltas.
+    private func emitFinalTranscript(_ text: String, startTime: Date, outputFile: FileHandle?) {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        let line: String
+
+        switch format {
+        case .text:
+            let ts = formatStreamTimestamp(elapsed)
+            line = "[\(ts)] \(trimmed)"
+        case .jsonl:
+            let jsonObj: [String: Any] = [
+                "time": round(elapsed * 10) / 10,
+                "text": trimmed,
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
+                  let jsonStr = String(data: data, encoding: .utf8) else {
+                return
             }
-            nonisolated(unsafe) let buf = buffer
-            try await engine.appendAudio(buf)
-            try await engine.processBufferedAudio()
-            offset = end
+            line = jsonStr
         }
 
-        // Critical: flush any remaining buffered audio so the tail of the transcript isn't dropped.
-        let finalText = try await engine.finish()
-        if verbose { log("Finalized. Total transcript length: \(finalText.count) chars") }
-
-        // Reset terminal line in case the live preview left an unfinished line on stderr.
-        FileHandle.standardError.write(Data("\n".utf8))
+        print(line)
+        fflush(stdout)
+        outputFile?.write(Data((line + "\n").utf8))
     }
 
     /// Set up the partial-transcript callback used by both mic and file modes.
