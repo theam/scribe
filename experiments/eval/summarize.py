@@ -121,6 +121,26 @@ def print_markdown(results: list[dict]):
                 row += " — |"
         print(row)
 
+    # --- Proper noun recall section (Earnings-21 only) ---
+    pn_results = [r for r in results if r["dataset"] == "earnings21" and int(r.get("proper_noun_total", 0)) > 0]
+    if pn_results:
+        print("\n## Proper Noun Recall (Earnings-21)\n")
+        print("WER averages all words equally. Proper noun recall measures how many entity-tagged ")
+        print("phrases (PERSON, ORG, GPE, PRODUCT, LAW, WORK_OF_ART, FAC) appear in the hypothesis.\n")
+        print("| File | Company | WER | Proper Noun Recall |")
+        print("|---|---|---|---|")
+        total_pn = found_pn = 0
+        for r in sorted(pn_results, key=lambda x: x["file_id"]):
+            wer = float(r["wer"])
+            pn_total = int(r["proper_noun_total"])
+            pn_found = int(r["proper_noun_found"])
+            pn_recall = float(r["proper_noun_recall"])
+            print(f"| {r['file_id']} | {r['label']} | {wer:.1%} | {pn_recall:.1%} ({pn_found}/{pn_total}) |")
+            total_pn += pn_total
+            found_pn += pn_found
+        agg_recall = found_pn / total_pn if total_pn else 0
+        print(f"\n**Aggregate**: {agg_recall:.1%} ({found_pn}/{total_pn} entities)")
+
     # --- Table 2: Per-file detail for primary model ---
     primary_model = "large-v3-turbo"
     primary = [r for r in results if r["model"] == primary_model]
@@ -142,7 +162,15 @@ def print_markdown(results: list[dict]):
     total_dur = sum(float(r["duration_secs"]) for r in turbo_all)
     total_proc = sum(float(r["processing_secs"]) for r in turbo_all)
 
-    print(f"- **Model**: Whisper {primary_model} via WhisperKit (CoreML, Apple Silicon)")
+    # Detect actual ASR engine based on scribe version
+    versions = sorted(set(r.get("scribe_version", "?") for r in turbo_all))
+    version_str = ", ".join(versions)
+    if any(v.startswith("0.2") or v.startswith("0.3") for v in versions):
+        engine = "NVIDIA Parakeet TDT v3 via FluidAudio (CoreML, Apple Silicon)"
+    else:
+        engine = f"Whisper {primary_model} via WhisperKit (CoreML, Apple Silicon)"
+    print(f"- **scribe version**: {version_str}")
+    print(f"- **ASR engine**: {engine}")
     print(f"- **Total audio evaluated**: {total_dur/60:.0f} minutes across {len(turbo_all)} files")
     print(f"- **Overall WER**: {total_errors/total_ref:.1%}")
     print(f"- **Average RTF**: {total_proc/total_dur:.3f}x ({total_dur/total_proc:.0f}x faster than real-time)")

@@ -25,6 +25,8 @@ from pathlib import Path
 import jiwer
 from huggingface_hub import hf_hub_download
 
+from proper_nouns import get_proper_nouns, score_recall
+
 # --- Configuration ---
 
 EVAL_DIR = Path(__file__).parent
@@ -325,6 +327,7 @@ def run_eval(entries: list[dict], model: str, scribe_version: str,
                 "wer": 0, "mer": 0, "wil": 0,
                 "substitutions": 0, "deletions": 0, "insertions": 0,
                 "ref_words": 0, "hyp_words": 0,
+                "proper_noun_total": 0, "proper_noun_found": 0, "proper_noun_recall": 0,
                 "error": str(e),
             })
             continue
@@ -333,8 +336,26 @@ def run_eval(entries: list[dict], model: str, scribe_version: str,
         metrics = compute_wer(entry["ref_text"], hypothesis)
         rtf = elapsed / entry["duration_secs"]
 
-        print(f"  WER: {metrics['wer']:.1%} | RTF: {rtf:.3f}x | "
-              f"S/D/I: {metrics['substitutions']}/{metrics['deletions']}/{metrics['insertions']}")
+        # Proper noun recall (only for Earnings-21 — has built-in entity tags)
+        pn_total = 0
+        pn_found = 0
+        pn_recall = 0.0
+        if entry["dataset"] == "earnings21":
+            try:
+                phrases = get_proper_nouns(entry["file_id"])
+                pn_result = score_recall(phrases, hypothesis)
+                pn_total = pn_result["total"]
+                pn_found = pn_result["found"]
+                pn_recall = pn_result["recall"]
+                print(f"  WER: {metrics['wer']:.1%} | Proper noun recall: {pn_recall:.1%} ({pn_found}/{pn_total}) | "
+                      f"RTF: {rtf:.3f}x | S/D/I: {metrics['substitutions']}/{metrics['deletions']}/{metrics['insertions']}")
+            except Exception as e:
+                print(f"  WARNING: proper noun scoring failed: {e}")
+                print(f"  WER: {metrics['wer']:.1%} | RTF: {rtf:.3f}x | "
+                      f"S/D/I: {metrics['substitutions']}/{metrics['deletions']}/{metrics['insertions']}")
+        else:
+            print(f"  WER: {metrics['wer']:.1%} | RTF: {rtf:.3f}x | "
+                  f"S/D/I: {metrics['substitutions']}/{metrics['deletions']}/{metrics['insertions']}")
 
         results.append({
             "file_id": fid,
@@ -354,6 +375,9 @@ def run_eval(entries: list[dict], model: str, scribe_version: str,
             "insertions": metrics["insertions"],
             "ref_words": metrics["ref_words"],
             "hyp_words": metrics["hyp_words"],
+            "proper_noun_total": pn_total,
+            "proper_noun_found": pn_found,
+            "proper_noun_recall": round(pn_recall, 4),
             "error": "",
         })
 
@@ -372,7 +396,9 @@ def write_csv(results: list[dict], output_path: Path):
         "processing_secs", "rtf",
         "wer", "mer", "wil",
         "substitutions", "deletions", "insertions",
-        "ref_words", "hyp_words", "error",
+        "ref_words", "hyp_words",
+        "proper_noun_total", "proper_noun_found", "proper_noun_recall",
+        "error",
     ]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
