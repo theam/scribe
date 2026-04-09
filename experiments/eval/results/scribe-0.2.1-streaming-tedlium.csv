@@ -1,6 +1,6 @@
 file_id,dataset,label,model,mode,duration_secs,speakers,scribe_version,processing_secs,rtf,wer,mer,wil,substitutions,deletions,insertions,ref_words,hyp_words,proper_noun_total,proper_noun_found,proper_noun_recall,error
-talk_0,tedlium,TED talk talk_0,nemotron-streaming,streaming,1249.0,1,0.2.1,113.5,0.0909,0.0746,0.0743,0.0986,72,133,11,2897,2775,0,0,0.0,
-talk_1,tedlium,TED talk talk_1,nemotron-streaming,streaming,1505.8,1,0.2.1,137.1,0.0911,0.0905,0.0903,0.1215,140,242,11,4342,4111,0,0,0.0,
-talk_2,tedlium,TED talk talk_2,nemotron-streaming,streaming,834.0,1,0.2.1,79.8,0.0957,0.0793,0.0788,0.1116,81,93,15,2383,2305,0,0,0.0,
-talk_3,tedlium,TED talk talk_3,nemotron-streaming,streaming,1095.5,1,0.2.1,102.0,0.0931,0.0441,0.044,0.0641,62,64,7,3015,2958,0,0,0.0,
-talk_4,tedlium,TED talk talk_4,nemotron-streaming,streaming,459.1,1,0.2.1,55.3,0.1203,0.0609,0.0606,0.0776,26,58,8,1510,1460,0,0,0.0,
+talk_0,tedlium,TED talk talk_0,nemotron-streaming,streaming,1249.0,1,0.2.1,106.7,0.0854,0.0746,0.0743,0.0986,72,133,11,2897,2775,0,0,0.0,
+talk_1,tedlium,TED talk talk_1,nemotron-streaming,streaming,1505.8,1,0.2.1,139.3,0.0925,0.0905,0.0903,0.1215,140,242,11,4342,4111,0,0,0.0,
+talk_2,tedlium,TED talk talk_2,nemotron-streaming,streaming,834.0,1,0.2.1,75.3,0.0903,0.0793,0.0788,0.1116,81,93,15,2383,2305,0,0,0.0,
+talk_3,tedlium,TED talk talk_3,nemotron-streaming,streaming,1095.5,1,0.2.1,101.8,0.0929,0.0441,0.044,0.0641,62,64,7,3015,2958,0,0,0.0,
+talk_4,tedlium,TED talk talk_4,nemotron-streaming,streaming,459.1,1,0.2.1,44.3,0.0965,0.0609,0.0606,0.0776,26,58,8,1510,1460,0,0,0.0,

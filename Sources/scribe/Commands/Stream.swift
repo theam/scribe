@@ -96,54 +96,90 @@ struct Stream: AsyncParsableCommand {
         try await runNemotronWithEngine(engine)
     }
 
+    /// Unified entry point for the Nemotron pipeline. Both file and mic modes
+    /// flow through the same drain loop — the only difference is the audio source.
     private func runNemotronWithEngine(_ engine: any StreamingAsrEngine) async throws {
         let startTime = Date()
         let outputFile = openOutputFile()
 
+        // Shared queue between the audio source (file or mic) and the drain loop.
+        // AsyncStream.Continuation.yield() is non-async and audio-thread-safe — this is
+        // FluidAudio's own pattern (see SlidingWindowAsrManager:63-65, 182-184).
+        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+
+        // Start the source. Mic mode keeps the AVAudioEngine and DispatchSourceSignal
+        // alive in `micResources` for the lifetime of the stream.
+        var micResources: NemotronMicResources? = nil
         if let path = audioFile {
-            // File mode: do NOT set up the per-chunk callback. Use finish() as the
-            // authoritative transcript source. The callback path drops content because
-            // (a) finish() may decode tokens after the last chunk callback, and
-            // (b) Task { } dispatched from the callback may not run before exit.
-            try await runNemotronFromFile(engine: engine, path: path, startTime: startTime, outputFile: outputFile)
+            try await feedNemotronFromFile(path: path, continuation: continuation)
         } else {
-            // Mic mode: live preview via per-chunk callback (acceptable streaming UX).
-            await setupNemotronCallback(engine: engine, startTime: startTime, outputFile: outputFile)
-            try await runNemotronFromMic(engine: engine)
+            micResources = try startMicSource(continuation: continuation)
         }
+
+        // Drain loop runs until the continuation finishes (file end or SIGINT).
+        try await runNemotronDrainLoop(
+            engine: engine,
+            stream: stream,
+            startTime: startTime,
+            outputFile: outputFile
+        )
+
+        // Cleanup mic resources after the drain loop has flushed via finish().
+        if let res = micResources {
+            res.audioEngine.stop()
+            res.audioEngine.inputNode.removeTap(onBus: 0)
+            res.signalSource.cancel()
+        }
+
+        outputFile?.closeFile()
     }
 
-    private func runNemotronFromMic(engine: any StreamingAsrEngine) async throws {
-        let audioEngine = AVAudioEngine()
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+    /// Drain the audio queue, feed the engine, poll the partial transcript, and emit
+    /// deltas. Used for both mic and file modes — the queue is the only difference.
+    private func runNemotronDrainLoop(
+        engine: any StreamingAsrEngine,
+        stream: AsyncStream<AVAudioPCMBuffer>,
+        startTime: Date,
+        outputFile: FileHandle?
+    ) async throws {
+        let state = StreamState()
 
-        if verbose {
-            log("Microphone: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) ch")
-        }
-
-        setupSignalHandler()
-
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
+        for await buffer in stream {
             nonisolated(unsafe) let buf = buffer
-            do { try engine.appendAudio(buf) } catch {}
+            try await engine.appendAudio(buf)
+            try await engine.processBufferedAudio()
+
+            // Live preview to stderr (text format only) — overwritten on each tick.
+            let current = await engine.getPartialTranscript()
+            emitLivePreview(current, startTime: startTime)
+
+            // Delta emission to stdout (and output file).
+            if let newText = await state.getNewText(current) {
+                emitDelta(newText, startTime: startTime, outputFile: outputFile)
+            }
         }
 
-        try audioEngine.start()
-        log("Listening (English, low latency)... press Ctrl+C to stop")
+        // Stream ended — flush any tail audio via finish() and emit remaining content.
+        // This is the bug fix from the previous phase: finish() may decode tokens that
+        // never reached the per-chunk path, so we always run its result through the
+        // delta logic to capture them.
+        let finalText = try await engine.finish()
+        if let newText = await state.getNewText(finalText) {
+            emitDelta(newText, startTime: startTime, outputFile: outputFile)
+        }
 
-        // Processing loop — drives the engine to process buffered audio
-        while true {
-            try await engine.processBufferedAudio()
-            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        // Newline so the final stderr preview line doesn't run into the next prompt.
+        if format == .text {
+            FileHandle.standardError.write(Data("\n".utf8))
         }
     }
 
-    /// Feed a pre-recorded audio file into the streaming engine.
-    /// Reads the whole file via FluidAudio's AudioConverter (16kHz mono Float32),
-    /// chunks it to mimic the live mic tap, calls finish() for the authoritative
-    /// transcript, and emits it once. No per-chunk callback (see runNemotronWithEngine).
-    private func runNemotronFromFile(engine: any StreamingAsrEngine, path: String, startTime: Date, outputFile: FileHandle?) async throws {
+    /// File source adapter — reads the whole file via AudioConverter (16kHz mono Float32),
+    /// pushes it as a single buffer, and finishes the continuation so the drain loop exits.
+    private func feedNemotronFromFile(
+        path: String,
+        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+    ) async throws {
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ValidationError("Audio file not found: \(path)")
@@ -158,60 +194,88 @@ struct Stream: AsyncParsableCommand {
         }
         log("Streaming from file (no microphone)...")
 
-        // Match the official FluidAudio reference pattern (NemotronTranscribe.swift):
-        // load the WHOLE file into a single AVAudioPCMBuffer and feed it as one
-        // appendAudio call. The engine handles internal chunking. This avoids any
-        // boundary issues from feeding the engine many tiny buffers in a loop.
-        guard let audioFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 16000,
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw ValidationError("Failed to create audio format")
-        }
-
-        let frameCount = AVAudioFrameCount(samples.count)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount) else {
+        guard let buffer = makeMonoFloat32Buffer(from: samples) else {
             throw ValidationError("Failed to allocate audio buffer")
         }
-        buffer.frameLength = frameCount
-        if let channelData = buffer.floatChannelData {
-            samples.withUnsafeBufferPointer { src in
-                memcpy(channelData[0], src.baseAddress!, samples.count * MemoryLayout<Float>.stride)
-            }
-        }
-        nonisolated(unsafe) let buf = buffer
-        try await engine.appendAudio(buf)
-        try await engine.processBufferedAudio()
-
-        // Authoritative final transcript: finish() pads any trailing partial chunk,
-        // returns the full decoded text, and clears internal state. We use this as
-        // the source of truth (not the per-chunk callback, which drops content).
-        let finalText = try await engine.finish()
-        if verbose { log(String(format: "Finalized. Final transcript: %d chars", finalText.count)) }
-
-        // Emit the complete transcript as a single result.
-        emitFinalTranscript(finalText, startTime: startTime, outputFile: outputFile)
+        continuation.yield(buffer)
+        continuation.finish()
     }
 
-    /// Emit the final (authoritative) transcript from finish() as one record.
-    /// In file mode this is the only output that goes to stdout — no per-chunk deltas.
-    private func emitFinalTranscript(_ text: String, startTime: Date, outputFile: FileHandle?) {
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
+    /// Mic source adapter — installs the input tap, pre-resamples each tap buffer to
+    /// 16kHz mono Float32 (matching the file path), yields it onto the shared stream,
+    /// and wires SIGINT to a DispatchSourceSignal that finishes the continuation
+    /// (replacing the brutal Darwin.exit(0) that used to drop tail audio).
+    private func startMicSource(
+        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+    ) throws -> NemotronMicResources {
+        let audioEngine = AVAudioEngine()
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
 
+        if verbose {
+            log("Microphone: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) ch")
+        }
+
+        // AudioConverter is a final class with only immutable state — safe to call
+        // resampleBuffer() from the audio render thread.
+        nonisolated(unsafe) let converter = AudioConverter()
+        nonisolated(unsafe) let cont = continuation
+
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
+            do {
+                let samples = try converter.resampleBuffer(buffer)
+                if let outBuffer = makeMonoFloat32Buffer(from: samples) {
+                    cont.yield(outBuffer)
+                }
+            } catch {
+                // Drop the buffer on resample error rather than crash the audio thread.
+            }
+        }
+
+        try audioEngine.start()
+        log("Listening (English, low latency)... press Ctrl+C to stop")
+
+        // Graceful shutdown via DispatchSourceSignal — replaces Darwin.exit(0).
+        // The handler runs on a regular dispatch queue (not the signal context), so
+        // it's safe to call continuation.finish() from here.
+        signal(SIGINT, SIG_IGN)
+        let sigSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+        sigSource.setEventHandler {
+            FileHandle.standardError.write(Data("\n[scribe] Stopping...\n".utf8))
+            cont.finish()
+        }
+        sigSource.resume()
+
+        return NemotronMicResources(audioEngine: audioEngine, signalSource: sigSource)
+    }
+
+    // MARK: - Nemotron emission helpers
+
+    /// Live preview line on stderr (text format only). Overwrites itself with `\r`.
+    private func emitLivePreview(_ fullTranscript: String, startTime: Date) {
+        guard format == .text else { return }
+        let preview = String(fullTranscript.trimmingCharacters(in: .whitespaces).suffix(100))
+        guard !preview.isEmpty else { return }
+        let elapsed = Date().timeIntervalSince(startTime)
+        let ts = formatStreamTimestamp(elapsed)
+        FileHandle.standardError.write(Data("\r\u{1B}[K[\(ts)] \(preview)".utf8))
+    }
+
+    /// Emit a confirmed delta to stdout (and output file). Format-aware.
+    private func emitDelta(_ newText: String, startTime: Date, outputFile: FileHandle?) {
         let elapsed = Date().timeIntervalSince(startTime)
         let line: String
 
         switch format {
         case .text:
+            // Clear the live preview line before writing the confirmed line on stdout.
+            FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
             let ts = formatStreamTimestamp(elapsed)
-            line = "[\(ts)] \(trimmed)"
+            line = "[\(ts)] \(newText)"
         case .jsonl:
             let jsonObj: [String: Any] = [
                 "time": round(elapsed * 10) / 10,
-                "text": trimmed,
+                "text": newText,
             ]
             guard let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
                   let jsonStr = String(data: data, encoding: .utf8) else {
@@ -223,65 +287,6 @@ struct Stream: AsyncParsableCommand {
         print(line)
         fflush(stdout)
         outputFile?.write(Data((line + "\n").utf8))
-    }
-
-    /// Set up the partial-transcript callback used by both mic and file modes.
-    private func setupNemotronCallback(engine: any StreamingAsrEngine, startTime: Date, outputFile: FileHandle?) async {
-        let state = StreamState()
-        let fmt = format
-
-        // Capture file handle for sendable closure
-        nonisolated(unsafe) let outFile = outputFile
-
-        // Partial callback — fires after each 560ms chunk with the full accumulated transcript.
-        // We diff to find new text and emit only the delta.
-        await engine.setPartialTranscriptCallback { fullTranscript in
-            Task {
-                let elapsed = Date().timeIntervalSince(startTime)
-
-                switch fmt {
-                case .text:
-                    // Show live preview on stderr (ephemeral, overwritten)
-                    let preview = String(fullTranscript.trimmingCharacters(in: .whitespaces).suffix(100))
-                    if !preview.isEmpty {
-                        let ts = formatStreamTimestamp(elapsed)
-                        FileHandle.standardError.write(Data("\r\u{1B}[K[\(ts)] \(preview)".utf8))
-                    }
-                case .jsonl:
-                    break
-                }
-
-                // Emit new portion to stdout
-                if let newText = await state.getNewText(fullTranscript) {
-                    let ts = formatStreamTimestamp(elapsed)
-
-                    let line: String
-                    switch fmt {
-                    case .text:
-                        FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
-                        line = "[\(ts)] \(newText)"
-                    case .jsonl:
-                        let jsonObj: [String: Any] = [
-                            "time": round(elapsed * 10) / 10,
-                            "text": newText,
-                        ]
-                        if let data = try? JSONSerialization.data(withJSONObject: jsonObj, options: [.sortedKeys]),
-                           let jsonStr = String(data: data, encoding: .utf8) {
-                            line = jsonStr
-                        } else {
-                            return
-                        }
-                    }
-
-                    print(line)
-                    fflush(stdout)
-
-                    if let file = outFile {
-                        file.write(Data((line + "\n").utf8))
-                    }
-                }
-            }
-        }
     }
 
     private func openOutputFile() -> FileHandle? {
@@ -417,6 +422,40 @@ private func formatStreamTimestamp(_ seconds: Double) -> String {
         return String(format: "%02d:%02d:%02d", hours, minutes, secs)
     }
     return String(format: "%02d:%02d", minutes, secs)
+}
+
+/// Resources held alive by mic mode for the duration of a stream session.
+/// The AVAudioEngine and DispatchSourceSignal must outlive the drain loop —
+/// dropping them would stop audio capture and cancel the signal handler.
+private struct NemotronMicResources {
+    let audioEngine: AVAudioEngine
+    let signalSource: any DispatchSourceSignal
+}
+
+/// Wrap a `[Float]` of 16kHz mono samples into a fresh AVAudioPCMBuffer.
+/// Used by both the file source (whole-file buffer) and the mic source
+/// (per-tap-buffer wrapping after resampling).
+private func makeMonoFloat32Buffer(from samples: [Float]) -> AVAudioPCMBuffer? {
+    guard let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16000,
+        channels: 1,
+        interleaved: false
+    ) else {
+        return nil
+    }
+    let frameCount = AVAudioFrameCount(samples.count)
+    guard frameCount > 0,
+          let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+        return nil
+    }
+    buffer.frameLength = frameCount
+    if let channelData = buffer.floatChannelData {
+        samples.withUnsafeBufferPointer { src in
+            memcpy(channelData[0], src.baseAddress!, samples.count * MemoryLayout<Float>.stride)
+        }
+    }
+    return buffer
 }
 
 enum StreamOutputFormat: String, ExpressibleByArgument, CaseIterable, Sendable {
