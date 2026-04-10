@@ -1,6 +1,6 @@
-file_id,dataset,label,model,duration_secs,speakers,scribe_version,processing_secs,rtf,wer,mer,wil,substitutions,deletions,insertions,ref_words,hyp_words,proper_noun_total,proper_noun_found,proper_noun_recall,error
-4386541,earnings21,Cumulus Media Inc,large-v3-turbo,1097.1,5,0.2.1,8.1,0.0073,0.1473,0.1404,0.2086,208,59,133,2715,2789,30,22,0.7333,
-4387332,earnings21,Zagg Inc,large-v3-turbo,1310.2,6,0.2.1,10.5,0.008,0.127,0.1226,0.1878,287,75,142,3969,4036,36,26,0.7222,
-4392809,earnings21,Lands End Inc,large-v3-turbo,1438.0,6,0.2.1,11.0,0.0076,0.1081,0.1052,0.1482,183,143,109,4025,3991,30,24,0.8,
-4384683,earnings21,One Gas Inc,large-v3-turbo,1476.8,8,0.2.1,10.6,0.0072,0.1487,0.1419,0.1934,199,166,170,3599,3603,40,29,0.725,
-4367318,earnings21,AcelRX Pharmaceuticals Inc,large-v3-turbo,1720.8,7,0.2.1,12.5,0.0073,0.1221,0.1192,0.1727,248,174,106,4323,4255,42,25,0.5952,
+file_id,dataset,label,model,mode,duration_secs,speakers,scribe_version,processing_secs,rtf,wer,mer,wil,substitutions,deletions,insertions,ref_words,hyp_words,proper_noun_total,proper_noun_found,proper_noun_recall,error
+4386541,earnings21,Cumulus Media Inc,large-v3-turbo,batch,1097.1,5,0.2.1,8.2,0.0075,0.1473,0.1404,0.2086,208,59,133,2715,2789,30,22,0.7333,
+4387332,earnings21,Zagg Inc,large-v3-turbo,batch,1310.2,6,0.2.1,10.4,0.008,0.127,0.1226,0.1878,287,75,142,3969,4036,36,26,0.7222,
+4392809,earnings21,Lands End Inc,large-v3-turbo,batch,1438.0,6,0.2.1,11.0,0.0076,0.1081,0.1052,0.1482,183,143,109,4025,3991,30,24,0.8,
+4384683,earnings21,One Gas Inc,large-v3-turbo,batch,1476.8,8,0.2.1,10.7,0.0073,0.1487,0.1419,0.1934,199,166,170,3599,3603,40,29,0.725,
+4367318,earnings21,AcelRX Pharmaceuticals Inc,large-v3-turbo,batch,1720.8,7,0.2.1,12.5,0.0073,0.1221,0.1192,0.1727,248,174,106,4323,4255,42,25,0.5952,

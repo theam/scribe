@@ -72,6 +72,19 @@ scribe transcribe meeting.wav --language es    # Spanish
 scribe transcribe meeting.wav --language fr    # French
 ```
 
+### Live streaming from microphone
+
+```bash
+scribe stream                      # multilingual (25 languages, ~11s latency)
+scribe stream --engine nemotron    # English-only, low latency (~560ms), with punctuation
+scribe stream --format jsonl       # JSONL output (one JSON object per line)
+scribe stream --output meeting.txt # save to file while streaming
+```
+
+> **Note on streaming engines:**
+> - **Default** (Parakeet TDT v3): Supports all 25 languages including Spanish. Higher latency (~11s for confirmed text) because it uses a batch model in sliding windows. Live preview appears on screen while speaking.
+> - **Nemotron** (`--engine nemotron`): English-only but much faster (~560ms latency). Includes punctuation and capitalization. Recommended for English-only meetings.
+
 ### Pre-download models
 
 ```bash
@@ -143,8 +156,10 @@ Tested on Apple Silicon (M-series):
 |------|-------|---------|
 | Transcription only | ~130x real-time | 4-min file in 1.7s |
 | Transcription + diarization | ~30x real-time | 4-min file in 7.5s |
+| Live streaming (Nemotron) | ~560ms latency | English, with punctuation |
+| Live streaming (default) | ~11s latency | 25 languages |
 
-Models are downloaded automatically on first use (~600MB for ASR, ~50MB for diarization).
+Models are downloaded automatically on first use (~600MB per model). First run may take a minute.
 
 ## Requirements
 
@@ -159,7 +174,7 @@ Bulgarian, Croatian, Czech, Danish, Dutch, English, Estonian, Finnish, French, G
 
 scribe is built on the shoulders of excellent open-source projects:
 
-- **[NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)** (CC-BY-4.0) — The speech recognition model that powers transcription
+- **[NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)** (CC-BY-4.0) — Speech recognition models (TDT v3 for batch, Nemotron for streaming)
 - **[FluidAudio](https://github.com/FluidInference/FluidAudio)** (Apache 2.0) by FluidInference — CoreML speech processing SDK for Apple Silicon
 - **[pyannote.audio](https://github.com/pyannote/pyannote-audio)** (MIT) by Herve Bredin — The diarization model architecture
 - **[swift-argument-parser](https://github.com/apple/swift-argument-parser)** (Apache 2.0) by Apple — CLI argument parsing

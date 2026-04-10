@@ -1,0 +1,6 @@
+file_id,dataset,label,model,mode,duration_secs,speakers,scribe_version,processing_secs,rtf,wer,mer,wil,substitutions,deletions,insertions,ref_words,hyp_words,proper_noun_total,proper_noun_found,proper_noun_recall,error
+4386541,earnings21,Cumulus Media Inc,nemotron-streaming,streaming,1097.1,5,0.2.1,102.9,0.0938,0.2063,0.1987,0.2615,182,274,104,2715,2545,30,22,0.7333,
+4387332,earnings21,Zagg Inc,nemotron-streaming,streaming,1310.2,6,0.2.1,121.9,0.093,0.2273,0.2216,0.2789,238,562,102,3969,3509,36,23,0.6389,
+4392809,earnings21,Lands End Inc,nemotron-streaming,streaming,1438.0,6,0.2.1,130.1,0.0905,0.1588,0.1535,0.1988,189,312,138,4025,3851,30,22,0.7333,
+4384683,earnings21,One Gas Inc,nemotron-streaming,streaming,1476.8,8,0.2.1,137.5,0.0931,0.1814,0.1739,0.2262,197,300,156,3599,3455,40,26,0.65,
+4367318,earnings21,AcelRX Pharmaceuticals Inc,nemotron-streaming,streaming,1720.8,7,0.2.1,167.1,0.0971,0.1594,0.1558,0.208,238,353,98,4323,4068,42,24,0.5714,

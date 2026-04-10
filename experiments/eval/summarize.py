@@ -121,25 +121,33 @@ def print_markdown(results: list[dict]):
                 row += " — |"
         print(row)
 
-    # --- Proper noun recall section (Earnings-21 only) ---
+    # --- Proper noun recall section (Earnings-21 only, split by mode) ---
     pn_results = [r for r in results if r["dataset"] == "earnings21" and int(r.get("proper_noun_total", 0)) > 0]
     if pn_results:
         print("\n## Proper Noun Recall (Earnings-21)\n")
         print("WER averages all words equally. Proper noun recall measures how many entity-tagged ")
         print("phrases (PERSON, ORG, GPE, PRODUCT, LAW, WORK_OF_ART, FAC) appear in the hypothesis.\n")
-        print("| File | Company | WER | Proper Noun Recall |")
-        print("|---|---|---|---|")
-        total_pn = found_pn = 0
-        for r in sorted(pn_results, key=lambda x: x["file_id"]):
-            wer = float(r["wer"])
-            pn_total = int(r["proper_noun_total"])
-            pn_found = int(r["proper_noun_found"])
-            pn_recall = float(r["proper_noun_recall"])
-            print(f"| {r['file_id']} | {r['label']} | {wer:.1%} | {pn_recall:.1%} ({pn_found}/{pn_total}) |")
-            total_pn += pn_total
-            found_pn += pn_found
-        agg_recall = found_pn / total_pn if total_pn else 0
-        print(f"\n**Aggregate**: {agg_recall:.1%} ({found_pn}/{total_pn} entities)")
+
+        modes = sorted(set(r.get("mode", "batch") for r in pn_results))
+        for mode in modes:
+            mode_results = [r for r in pn_results if r.get("mode", "batch") == mode]
+            if not mode_results:
+                continue
+            label_model = mode_results[0]["model"]
+            print(f"\n### {mode} ({label_model})\n")
+            print("| File | Company | WER | Proper Noun Recall |")
+            print("|---|---|---|---|")
+            total_pn = found_pn = 0
+            for r in sorted(mode_results, key=lambda x: x["file_id"]):
+                wer = float(r["wer"])
+                pn_total = int(r["proper_noun_total"])
+                pn_found = int(r["proper_noun_found"])
+                pn_recall = float(r["proper_noun_recall"])
+                print(f"| {r['file_id']} | {r['label']} | {wer:.1%} | {pn_recall:.1%} ({pn_found}/{pn_total}) |")
+                total_pn += pn_total
+                found_pn += pn_found
+            agg_recall = found_pn / total_pn if total_pn else 0
+            print(f"\n**Aggregate**: {agg_recall:.1%} ({found_pn}/{total_pn} entities)")
 
     # --- Table 2: Per-file detail for primary model ---
     primary_model = "large-v3-turbo"
