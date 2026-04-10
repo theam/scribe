@@ -87,13 +87,38 @@ struct Stream: AsyncParsableCommand {
 
             let freshEngine = StreamingAsrEngineFactory.create(.nemotron1120ms)
             try await freshEngine.loadModels()
-            log("Retry successful.")
+            log("Retry successful. Warming up...")
+            try await warmUpEngine(freshEngine)
+            log("Ready.")
             try await runNemotronWithEngine(freshEngine)
             return
         }
 
-        log("Models loaded.")
+        log("Models loaded. Warming up...")
+        try await warmUpEngine(engine)
+        log("Ready.")
         try await runNemotronWithEngine(engine)
+    }
+
+    /// Force CoreML model compilation by running one silent chunk through the engine.
+    /// Without this, the first real audio chunk blocks for 10-20s while CoreML compiles
+    /// the neural network, causing all live output to batch up and appear at once.
+    private func warmUpEngine(_ engine: any StreamingAsrEngine) async throws {
+        guard let fmt = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false
+        ) else { return }
+
+        // One complete chunk of silence (1120ms = 17920 samples at 16kHz).
+        let chunkSamples: AVAudioFrameCount = 17920
+        guard let silence = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: chunkSamples) else { return }
+        silence.frameLength = chunkSamples
+        // Buffer is zero-initialized by default — silence.
+
+        nonisolated(unsafe) let buf = silence
+        try await engine.appendAudio(buf)
+        try await engine.processBufferedAudio()
+        // Discard the silence tokens so they don't pollute the real transcript.
+        try await engine.reset()
     }
 
     /// Unified entry point for the Nemotron pipeline. Both file and mic modes
