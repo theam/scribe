@@ -49,8 +49,11 @@ struct Stream: AsyncParsableCommand {
     @Option(name: .long, help: "Streaming engine: default (multilingual, higher latency) or nemotron (English-only, low latency ~560ms).")
     var engine: StreamEngine = .default
 
-    @Option(name: .shortAndLong, help: "Also save output to file.")
+    @Option(name: .shortAndLong, help: "Save transcript to file.")
     var output: String?
+
+    @Option(name: .long, help: "Save captured audio to WAV file. After streaming ends, the saved audio is automatically re-transcribed with the batch engine for higher accuracy.")
+    var saveAudio: String?
 
     @Flag(name: .long, help: "Show status information.")
     var verbose: Bool = false
@@ -127,6 +130,9 @@ struct Stream: AsyncParsableCommand {
         let startTime = Date()
         let outputFile = openOutputFile()
 
+        // Open audio recording file if --save-audio was passed.
+        let audioWriter = try openAudioWriter()
+
         // Shared queue between the audio source (file or mic) and the drain loop.
         // AsyncStream.Continuation.yield() is non-async and audio-thread-safe — this is
         // FluidAudio's own pattern (see SlidingWindowAsrManager:63-65, 182-184).
@@ -146,7 +152,8 @@ struct Stream: AsyncParsableCommand {
             engine: engine,
             stream: stream,
             startTime: startTime,
-            outputFile: outputFile
+            outputFile: outputFile,
+            audioWriter: audioWriter
         )
 
         // Cleanup mic resources after the drain loop has flushed via finish().
@@ -157,6 +164,13 @@ struct Stream: AsyncParsableCommand {
         }
 
         outputFile?.closeFile()
+
+        // If we recorded audio, run batch transcription for a polished final transcript.
+        if let audioPath = saveAudio, audioWriter != nil {
+            log("Saved audio to: \(audioPath)")
+            log("Running batch transcription for polished output...")
+            try await runBatchTranscription(audioPath: audioPath, outputFile: outputFile)
+        }
     }
 
     /// Drain the audio queue, feed the engine, poll the partial transcript, and emit
@@ -165,11 +179,17 @@ struct Stream: AsyncParsableCommand {
         engine: any StreamingAsrEngine,
         stream: AsyncStream<AVAudioPCMBuffer>,
         startTime: Date,
-        outputFile: FileHandle?
+        outputFile: FileHandle?,
+        audioWriter: AVAudioFile? = nil
     ) async throws {
         let state = StreamState()
 
         for await buffer in stream {
+            // Save audio for later batch processing if --save-audio was passed.
+            if let writer = audioWriter {
+                try? writer.write(from: buffer)
+            }
+
             nonisolated(unsafe) let buf = buffer
             try await engine.appendAudio(buf)
             try await engine.processBufferedAudio()
@@ -287,16 +307,36 @@ struct Stream: AsyncParsableCommand {
     }
 
     /// Emit a confirmed delta to stdout (and output file). Format-aware.
+    ///
+    /// Text mode: tokens flow naturally without timestamps. A newline is inserted
+    /// after sentence-ending punctuation (. ? !) so output reads as prose:
+    ///   "Hello computer. Can you help me with something?\n"
+    ///
+    /// JSONL mode: one JSON object per delta, with timestamp (for machine consumption).
     private func emitDelta(_ newText: String, startTime: Date, outputFile: FileHandle?) {
         let elapsed = Date().timeIntervalSince(startTime)
-        let line: String
 
         switch format {
         case .text:
-            // Clear the live preview line before writing the confirmed line on stdout.
+            // Clear the live preview line before writing confirmed text.
             FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
-            let ts = formatStreamTimestamp(elapsed)
-            line = "[\(ts)] \(newText)"
+
+            // Stream text naturally: append tokens, newline on sentence boundaries.
+            var textToWrite = newText
+            // Insert newline after sentence-ending punctuation followed by a space or end.
+            textToWrite = textToWrite.replacingOccurrences(of: ". ", with: ".\n")
+            textToWrite = textToWrite.replacingOccurrences(of: "? ", with: "?\n")
+            textToWrite = textToWrite.replacingOccurrences(of: "! ", with: "!\n")
+            // Also handle punctuation at the very end of the delta.
+            if textToWrite.hasSuffix(".") || textToWrite.hasSuffix("?") || textToWrite.hasSuffix("!") {
+                textToWrite += "\n"
+            }
+
+            // Write WITHOUT trailing newline (tokens append naturally on the same line).
+            FileHandle.standardOutput.write(Data(textToWrite.utf8))
+            fflush(stdout)
+            outputFile?.write(Data(textToWrite.utf8))
+
         case .jsonl:
             let jsonObj: [String: Any] = [
                 "time": round(elapsed * 10) / 10,
@@ -306,18 +346,59 @@ struct Stream: AsyncParsableCommand {
                   let jsonStr = String(data: data, encoding: .utf8) else {
                 return
             }
-            line = jsonStr
+            print(jsonStr)
+            fflush(stdout)
+            outputFile?.write(Data((jsonStr + "\n").utf8))
         }
-
-        print(line)
-        fflush(stdout)
-        outputFile?.write(Data((line + "\n").utf8))
     }
 
     private func openOutputFile() -> FileHandle? {
         guard let outputPath = output else { return nil }
         FileManager.default.createFile(atPath: outputPath, contents: nil)
         return FileHandle(forWritingAtPath: outputPath)
+    }
+
+    /// Open an AVAudioFile for writing 16kHz mono Float32 WAV — the same format the
+    /// engine sees, so the saved file can be batch-transcribed directly.
+    private func openAudioWriter() throws -> AVAudioFile? {
+        guard let path = saveAudio else { return nil }
+        guard let fmt = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false
+        ) else {
+            throw ValidationError("Failed to create audio format for recording")
+        }
+        return try AVAudioFile(forWriting: URL(fileURLWithPath: path), settings: fmt.settings)
+    }
+
+    /// Run batch transcription (Parakeet TDT v3) on a saved audio file for a polished
+    /// final transcript. Called after the stream ends when --save-audio is used.
+    private func runBatchTranscription(audioPath: String, outputFile: FileHandle?) async throws {
+        let converter = AudioConverter()
+        let samples = try converter.resampleAudioFile(URL(fileURLWithPath: audioPath))
+        let duration = Double(samples.count) / 16000.0
+
+        let asrModels = try await AsrModels.downloadAndLoad(version: .v3)
+        let asrManager = AsrManager()
+        try await asrManager.initialize(models: asrModels)
+
+        let startTime = Date()
+        let asrResult = try await asrManager.transcribe(samples, source: .system)
+        let elapsed = Date().timeIntervalSince(startTime)
+
+        log(String(format: "Batch transcription: %.0fs audio in %.1fs (%.0fx real-time)",
+                   duration, elapsed, duration / elapsed))
+
+        // Emit the polished transcript.
+        let text = asrResult.text.trimmingCharacters(in: .whitespaces)
+
+        FileHandle.standardError.write(Data("\n--- Polished transcript (batch) ---\n".utf8))
+        print(text)
+        fflush(stdout)
+
+        if let file = outputFile {
+            file.write(Data("\n--- Polished transcript (batch) ---\n".utf8))
+            file.write(Data((text + "\n").utf8))
+        }
     }
 
     // MARK: - SlidingWindow Engine (Multilingual, default)
